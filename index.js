@@ -249,7 +249,8 @@ async function connectWhatsApp() {
         setTimeout(() => {
             retryCount = 0;
             console.log('🔄 Reset retry count - Nouvelle tentative autorisée');
-        }, 300000);
+            connectWhatsApp();
+        }, 60000);
         
         return null;
     }
