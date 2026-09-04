@@ -22,6 +22,7 @@ const {
     useMultiFileAuthState
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const express = require('express');
 const mongoose = require('mongoose');
 const pino = require('pino');
@@ -60,6 +61,8 @@ let connectionOpenCount = 0;
 let isBotStarting = false;
 let reconnectTimeout = null;
 let retryCount = 0;
+let currentQR = null;
+let qrGeneratedAt = null;
 
 // ==================== MODÈLE MONGODB ====================
 const AuthSchema = new mongoose.Schema({
@@ -330,6 +333,8 @@ async function connectWhatsApp() {
             // ⭐ GESTION QR CODE (remplace printQRInTerminal)
             if (qr) {
                 isReady = false;
+                currentQR = qr;
+                qrGeneratedAt = Date.now();
                 
                 console.log('\n' + '╔'.repeat(50));
                 console.log('║' + ' '.repeat(15) + '📸 QR CODE GÉNÉRÉ !' + ' '.repeat(14) + '║');
@@ -700,6 +705,54 @@ async function processBulkJob() {
 }
 
 // ==================== ROUTES API ====================
+
+// Affichage du QR code sous forme d'image (plus fiable que l'ASCII dans les logs)
+app.get('/qr', async (req, res) => {
+    if (isReady) {
+        return res.send(`
+            <html><body style="font-family:sans-serif;text-align:center;padding:40px">
+                <h2>✅ Bot déjà connecté</h2>
+                <p>Aucun QR à scanner — le bot est déjà lié à WhatsApp.</p>
+            </body></html>
+        `);
+    }
+
+    if (!currentQR) {
+        return res.send(`
+            <html><head><meta http-equiv="refresh" content="3"></head>
+            <body style="font-family:sans-serif;text-align:center;padding:40px">
+                <h2>⏳ En attente du QR...</h2>
+                <p>Rechargement automatique dans 3 secondes.</p>
+            </body></html>
+        `);
+    }
+
+    const ageSeconds = Math.round((Date.now() - qrGeneratedAt) / 1000);
+    if (ageSeconds > 18) {
+        return res.send(`
+            <html><head><meta http-equiv="refresh" content="2"></head>
+            <body style="font-family:sans-serif;text-align:center;padding:40px">
+                <h2>⌛ QR expiré, régénération...</h2>
+                <p>Rechargement automatique dans 2 secondes.</p>
+            </body></html>
+        `);
+    }
+
+    try {
+        const qrImage = await QRCode.toDataURL(currentQR, { width: 400, margin: 2 });
+        res.send(`
+            <html><head><meta http-equiv="refresh" content="5"></head>
+            <body style="font-family:sans-serif;text-align:center;padding:40px">
+                <h2>📸 Scannez ce QR code</h2>
+                <img src="${qrImage}" alt="QR Code WhatsApp" style="border:4px solid #333;border-radius:8px" />
+                <p>WhatsApp > Paramètres > Appareils liés > Lier un appareil</p>
+                <p style="color:#888">Actualisation automatique toutes les 5s — âge du QR : ${ageSeconds}s</p>
+            </body></html>
+        `);
+    } catch (e) {
+        res.status(500).send('Erreur génération QR: ' + e.message);
+    }
+});
 
 // Health check simple
 app.get('/ping', (req, res) => res.status(200).send('pong'));
