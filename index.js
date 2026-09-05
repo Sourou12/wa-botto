@@ -755,6 +755,32 @@ app.get('/qr', async (req, res) => {
     }
 });
 
+// ==================== WEBHOOK META (WhatsApp Business Cloud API) ====================
+// Nécessaire pour la vérification de callback lors de la configuration
+// du produit WhatsApp dans Meta Business Manager.
+const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'change_this_token';
+
+app.get('/webhook', (req, res) => {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+        console.log('✅ Webhook Meta vérifié avec succès');
+        return res.status(200).send(challenge);
+    }
+    console.log('❌ Échec de vérification webhook Meta (token attendu vs reçu ne correspondent pas)');
+    return res.sendStatus(403);
+});
+
+app.post('/webhook', (req, res) => {
+    // Accuse réception immédiatement (Meta exige une réponse 200 rapide).
+    // Le contenu (statuts de livraison, messages entrants) n'est pas encore traité,
+    // juste loggé pour l'instant.
+    console.log('📩 Événement webhook Meta reçu:', JSON.stringify(req.body).substring(0, 300));
+    res.sendStatus(200);
+});
+
 // Health check simple
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
