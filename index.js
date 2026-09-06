@@ -53,7 +53,7 @@ const TIMEOUT_CONFIG = {
     RETRY_DELAY_MAX: 60000,
     MAX_RETRIES: 5
 };
-const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '0165212113';
+const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '2290140443431';
 
 // ==================== VARIABLES GLOBALES ====================
 let sock = null;
