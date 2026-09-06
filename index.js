@@ -56,7 +56,7 @@ const TIMEOUT_CONFIG = {
     RETRY_DELAY_MAX: 60000,
     MAX_RETRIES: 5
 };
-const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '2290165212113';
+const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '2290140443431';
 
 // ==================== VARIABLES GLOBALES ====================
 let sock = null;
@@ -250,12 +250,11 @@ async function connectWhatsApp() {
         console.error(`💥 Max retries atteint (${TIMEOUT_CONFIG.MAX_RETRIES}) - Attente manuelle ou reset`);
         isBotStarting = false;
         
-        // ⭐ AUGMENTÉ: 60s → 120s avant reset
         reconnectTimeout = setTimeout(() => {
             retryCount = 0;
             console.log('🔄 Reset retry count - Nouvelle tentative autorisée');
             connectWhatsApp();
-        }, 120000);  // 2 minutes au lieu de 1
+        }, 60000);
         
         return null;
     }
@@ -271,8 +270,8 @@ async function connectWhatsApp() {
 
         console.log('🗄️ Connexion MongoDB Atlas...');
         await mongoose.connect(MONGO_URI, {
-            serverSelectionTimeoutMS: 30000,      // ⭐ AUGMENTÉ: 15s → 30s
-            socketTimeoutMS: 120000,              // ⭐ AUGMENTÉ: 60s → 120s
+            serverSelectionTimeoutMS: 15000,
+            socketTimeoutMS: 60000,
             maxPoolSize: 10,
             bufferCommands: false
         });
@@ -290,7 +289,7 @@ async function connectWhatsApp() {
             }
             sock = null;
             isReady = false;
-            await sleep(5000);  // ⭐ AUGMENTÉ: 3s → 5s
+            await sleep(3000);
         }
 
         // Annuler reconnexion planifiée si existante
@@ -307,17 +306,17 @@ async function connectWhatsApp() {
             usePairingCode: true,
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
+            
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             
-            // ⭐⭐⭐ TIMEOUTS SIGNIFICATIVEMENT AUGMENTÉS ⭐⭐⭐
-            connectTimeoutMs: 300000,      // 180s → 300s (5 minutes)
-            queryTimeoutMs: 300000,       // 180s → 300s (5 minutes)
-            keepAliveIntervalMs: 45000,   // 30s → 45s
+            connectTimeoutMs: currentTimeout,
+            keepAliveIntervalMs: TIMEOUT_CONFIG.KEEP_ALIVE_INTERVAL,
+            queryTimeoutMs: currentTimeout,
             
             logger: pino({ level: 'warn' }),
             markOnlineOnConnect: false,
-            retryRequestDelayMs: 10000,   // ⭐ AUGMENTÉ: 5s → 10s
-            maxMsgRetryCount: 5           // ⭐ AUGMENTÉ: 3 → 5
+            retryRequestDelayMs: 5000,
+            maxMsgRetryCount: 3
         });
 
         // Sauvegarde des crédentiels
@@ -336,7 +335,7 @@ async function connectWhatsApp() {
             // N'exécute la demande de code QU'UNE SEULE FOIS
             if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
                 pairingCodeRequested = true;
-                await sleep(5000);  // ⭐ AUGMENTÉ: 3s → 5s
+                await sleep(3000);
 
                 try {
                     const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
@@ -365,7 +364,7 @@ async function connectWhatsApp() {
                 
                 if (shouldReconnect) {
                     retryCount++;
-                    const delay = getProgressiveDelay();  // Voir fonction ci-dessous
+                    const delay = getProgressiveDelay();
                     console.log(`🔄 Reconnexion dans ${delay / 1000}s...`);
                     reconnectTimeout = setTimeout(() => connectWhatsApp(), delay);
                 } else {
@@ -424,7 +423,7 @@ async function connectWhatsApp() {
         pairingCodeRequested = false;
         retryCount++;
         
-        const delay = getProgressiveDelay();  // Fonction améliorée ci-dessous
+        const delay = getProgressiveDelay();
         console.log(`🔄 Planification nouvelle tentative dans ${delay / 1000}s (retry #${retryCount})\n`);
         
         setTimeout(() => connectWhatsApp(), delay);
@@ -433,21 +432,7 @@ async function connectWhatsApp() {
     }
 }
 
-// ⭐ NOUVELLE FONCTION: Délais progressifs augmentés
-function getProgressiveDelay() {
-    // Base: 15s (au lieu de 5-10s), puis augmentation exponentielle
-    const baseDelay = 15000;           // 15 secondes de base
-    const multiplier = Math.pow(1.8, retryCount);  // Facteur 1.8 (moins agressif que 2)
-    const maxDelay = 180000;           // Maximum 3 minutes
-    
-    let delay = Math.min(baseDelay * multiplier, maxDelay);
-    
-    // Ajouter un peu d'aléatoire (jitter) pour éviter les thundering herd
-    const jitter = Math.random() * 5000;  // 0-5s aléatoire
-    delay += jitter;
-    
-    return Math.round(delay);
-}
+
 // ==================== PROCESSING BULK JOB ====================
 async function processBulkJob() {
     if (!bulkJob || isProcessing) return;
