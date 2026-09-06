@@ -1,19 +1,18 @@
 // ============================================================
-// 🤖 WHATSAPP BOT - VERSION COMPLÈTE EN UN SEUL FICHIER
-// ✅ Fonctionne sur Render/Heroku sans configuration complexe
+// 🤖 WHATSAPP BOT v3.2 - COMPATIBLE BAILEYS 6.7.9
+// ✅ Corrigé: useMongoDBAuthState
 // ============================================================
 
 const mongoose = require('mongoose');
 const express = require('express');
 const { 
     makeWASocket, 
-    useMongoDBAuthState, 
     DisconnectReason,
-    delay
+    useMultiFileAuthState,
+    makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
-// Chargement optionnel de dotenv (ne crashera pas si absent)
 try { require('dotenv').config(); } catch(e) {}
 
 // ============================================================
@@ -52,6 +51,105 @@ let initTimeoutHandle = null;
 let sendQueue = [];
 
 // ============================================================
+// 🗄️ MODÈLE MONGODB POUR LES CRÉDENTIELS
+// ============================================================
+
+// Schéma pour stocker les crédentiels d'authentification
+const AuthSchema = new mongoose.Schema({
+    key: { type: String, required: true, unique: true },
+    value: { type: mongoose.Schema.Types.Mixed, required: true }
+}, { collection: 'wa_auth_store' });
+
+const AuthModel = mongoose.model('Auth', AuthSchema);
+
+/**
+ * Crée un store d'authentification compatible avec Baileys utilisant MongoDB
+ */
+async function useMongoAuthState() {
+    console.log('🔑 Chargement auth state depuis MongoDB...');
+    
+    const readData = {};
+    const saveData = {};
+    
+    // Charger toutes les données depuis MongoDB
+    try {
+        const docs = await AuthModel.find({});
+        for (const doc of docs) {
+            // Reconstruire Buffer si nécessaire
+            let value = doc.value;
+            if (value && value.type === 'Buffer' && Array.isArray(value.data)) {
+                value = Buffer.from(value.data);
+            }
+            readData[doc.key] = value;
+        }
+        console.log(`   ✅ ${Object.keys(readData).length} clés chargées`);
+    } catch(e) {
+        console.log('   ℹ️  Pas de données existantes (première connexion?)');
+    }
+    
+    // Fonction de sauvegarde
+    const saveCreds = async (creds) => {
+        try {
+            const data = { ...readData, ...creds };
+            
+            for (const [key, value] of Object.entries(data)) {
+                const valueToSave = value instanceof Buffer ? 
+                    { type: 'Buffer', data: Array.from(value) } : value;
+                
+                await AuthModel.findOneAndUpdate(
+                    { key },
+                    { key, value: valueToSave },
+                    { upsert: true }
+                );
+            }
+            
+            Object.assign(readData, creds);
+            console.log('💾 Créds sauvegardés dans MongoDB');
+        } catch(err) {
+            console.error('❌ Erreur sauvegarde creds:', err.message);
+        }
+    };
+    
+    return {
+        state: {
+            creds: readData.creds || {},
+            keys: {
+                get: async (type, ids) => {
+                    const result = {};
+                    for (const id of ids) {
+                        const key = `${type}-${id}`;
+                        if (readData[key]) {
+                            result[id] = readData[key];
+                        }
+                    }
+                    return result;
+                },
+                set: async (data) => {
+                    for (const type in data) {
+                        for (const id in data[type]) {
+                            const key = `${type}-${id}`;
+                            readData[key] = data[type][id];
+                            
+                            // Sauvegarder immédiatement en DB
+                            const value = readData[key];
+                            const valueToSave = value instanceof Buffer ? 
+                                { type: 'Buffer', data: Array.from(value) } : value;
+                            
+                            await AuthModel.findOneAndUpdate(
+                                { key },
+                                { key, value: valueToSave },
+                                { upsert: true }
+                            ).catch(() => {});
+                        }
+                    }
+                }
+            }
+        },
+        saveCreds
+    };
+}
+
+// ============================================================
 // 🌐 SERVEUR EXPRESS
 // ============================================================
 
@@ -60,7 +158,7 @@ app.use(express.json());
 
 app.get('/', (req, res) => {
     res.json({ 
-        service: 'WhatsApp Bot', 
+        service: 'WhatsApp Bot v3.2', 
         status: 'running',
         endpoints: ['/api/health', '/api/send', '/api/qr']
     });
@@ -87,7 +185,7 @@ app.post('/api/send', async (req, res) => {
         
         if (!isFullyInitialized || !sock || sock.ws?.readyState !== 1) {
             sendQueue.push({ jid, message, time: Date.now() });
-            return res.json({ queued: true, message: 'Message en attente de connexion' });
+            return res.json({ queued: true, message: 'Message en attente' });
         }
         
         const result = await Promise.race([
@@ -155,8 +253,10 @@ async function connectWhatsApp() {
         }
         console.log('✅ MongoDB OK\n');
 
-        // Auth
-        const { state, saveCreds } = await useMongoDBAuthState();
+        // ✅ CORRECTION ICI : Utiliser notre propre fonction au lieu de useMongoDBAuthState
+        console.log('🔑 Chargement auth state...');
+        const { state, saveCreds } = await useMongoAuthState();
+        console.log('✅ Auth state chargé\n');
 
         // Cleanup ancien socket
         if (sock) {
@@ -176,6 +276,8 @@ async function connectWhatsApp() {
         
         sock = makeWASocket({
             auth: state,
+            printQRInTerminal: false,  // On gère nous-même le QR
+            
             usePairingCode: true,
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
@@ -200,11 +302,12 @@ async function connectWhatsApp() {
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
-            // QR
+            // QR Code
             if (qr) {
                 currentQR = qr;
                 qrGeneratedAt = Date.now();
-                console.log('📷 QR Code généré');
+                console.log('\n📷 QR CODE GÉNÉRÉ !');
+                console.log('   Disponible via GET /api/qr\n');
             }
 
             // Pairing code
@@ -217,14 +320,20 @@ async function connectWhatsApp() {
                     if (!num || num.length < 10) throw new Error('Numéro invalide');
                     
                     const code = await sock.requestPairingCode(num);
-                    console.log(`\n🔑 CODE: ${code}\n📱 NUMÉRO: ${num}\n`);
+                    
+                    console.log('\n' + '='.repeat(50));
+                    console.log(`📱 NUMÉRO CIBLE : ${num}`);
+                    console.log(`🔑 CODE D'APPAIRAGE : ${code}`);
+                    console.log('=' .repeat(50));
+                    console.log('\n⏰ Entrez ce code rapidement (expire en ~20s)\n');
+                    
                 } catch(e) {
-                    console.error('❌ Pairing:', e.message);
+                    console.error('❌ Erreur pairing code:', e.message);
                     pairingCodeRequested = false;
                 }
             }
 
-            // Close
+            // Connexion fermée
             if (connection === 'close') {
                 isReady = false;
                 isFullyInitialized = false;
@@ -237,20 +346,22 @@ async function connectWhatsApp() {
                 const code = lastDisconnect?.error?.output?.statusCode;
                 const reconnect = code !== DisconnectReason.loggedOut;
                 
-                console.log(`\n❌ Fermée (${code}) - Reconnect: ${reconnect}`);
+                console.log(`\n❌ Connexion fermée (Status: ${code || 'N/A'})`);
+                console.log(`   Reconnexion auto: ${reconnect ? 'OUI ✅' : 'NON ❌'}\n`);
                 
                 if (reconnect) {
                     retryCount++;
                     const d = getDelay();
-                    console.log(`🔄 Retry dans ${(d/1000).toFixed(1)}s\n`);
+                    console.log(`🔄 Reconnexion dans ${(d/1000).toFixed(1)}s (retry #${retryCount})\n`);
                     reconnectTimeout = setTimeout(connectWhatsApp, d);
                 } else {
-                    console.log('⛔ Logged out\n');
+                    console.log('⛔ Déconnexion volontaire (logged out)');
+                    console.log('   → Supprimez la collection "wa_auth_store" et redémarrez\n');
                     retryCount = 0;
                 }
             }
 
-            // Open
+            // Connexion ouverte ✅
             if (connection === 'open') {
                 isReady = true;
                 isBotStarting = false;
@@ -258,32 +369,41 @@ async function connectWhatsApp() {
                 errorHandled = false;
                 currentQR = null;
                 
-                console.log(`\n✅ CONNEXION RÉUSSIE !`);
-                console.log(`👤 ${sock.user?.name || '?'}`);
-                console.log(`📱 ${sock.user?.id || '?'}`);
-                console.log(`\n⏳ Initialisation... (${CONFIG.TIMEOUTS.INIT_MAX_WAIT_MS/1000}s max)\n`);
+                console.log('\n✅'.repeat(30));
+                console.log('  CONNEXION WHATSAPP RÉUSSIE !');
+                console.log('✅'.repeat(30));
+                console.log(`\n👤 Nom: ${sock.user?.name || 'Sans nom'}`);
+                console.log(`📱 JID: ${sock.user?.id || 'Inconnu'}`);
+                console.log(`\n⏳ Attente finalisation initialisation...`);
+                console.log(`   (Max ${CONFIG.TIMEOUTS.INIT_MAX_WAIT_MS / 1000}s avant reconnexion si échec)\n`);
 
                 // Timeout si l'init bloque trop longtemps
                 initTimeoutHandle = setTimeout(async () => {
                     if (!isFullyInitialized && isReady) {
-                        console.warn('⚠️ Init trop longue - Reconnexion...\n');
+                        console.warn('\n⚠️ Initialisation trop longue (>90s)');
+                        console.warn('→ Reconnexion forcée planifiée...\n');
                         await forceReconnect();
                     }
                 }, CONFIG.TIMEOUTS.INIT_MAX_WAIT_MS);
             }
         });
 
-        // Erreurs socket
+        // Gestion erreurs socket
         sock.ev.on('error', async (error) => {
             const msg = error?.message || '';
             const stack = error?.stack || '';
-            const isInitError = stack.includes('chats.js') || stack.includes('fetchProps');
+            const isInitError = stack.includes('chats.js') || stack.includes('fetchProps') || stack.includes('executeInitQueries');
 
-            // Timeout pendant l'init des chats → RECONNEXION FORCÉE
+            // ⭐ Timeout pendant l'init des chats → RECONNEXION FORCÉE
             if ((msg.includes('Timed Out') || stack.includes('Timed Out')) && isInitError) {
                 if (!errorHandled) {
                     errorHandled = true;
-                    console.warn('\n⚠️ Timeout chats.js → Reconnexion forcée\n');
+                    
+                    console.warn('\n' + '⚠️'.repeat(35));
+                    console.warn('  TIMEOUT SYNCHRO CHATS DÉTECTÉ');
+                    console.warn('  → Socket instable pour envoi');
+                    console.warn('  → Reconnexion forcée immédiate');
+                    console.warn('⚠️'.repeat(35) + '\n');
                     
                     if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
                     await forceReconnect();
@@ -293,26 +413,37 @@ async function connectWhatsApp() {
 
             // Autres timeouts (non critiques)
             if (msg.includes('Timed Out')) {
-                console.warn('⚠️ Timeout (normal)\n');
+                console.warn('⚠️ Timeout socket (non-critique)\n');
                 return;
             }
 
             // Stream errors (normaux)
-            if (msg.includes('stream') || msg.includes('conflict')) return;
+            if (msg.includes('stream') || msg.includes('conflict') || msg.includes('Stream removed')) {
+                return; // Silencieux
+            }
 
             // Presence warning (inoffensif)
-            if (msg.includes('no name present')) return;
+            if (msg.includes('no name present')) {
+                return; // Silencieux
+            }
 
-            console.error('❌ Socket error:', msg.substring(0, 150));
+            console.error('❌ Erreur socket inattendue:');
+            console.error(`   Type: ${error.constructor.name}`);
+            console.error(`   Message: ${msg.substring(0, 200)}\n`);
         });
 
         // Messages entrants
         sock.ev.on('messages.upsert', async ({ messages }) => {
-            // Marquer comme initialisé quand on reçoit un message
+            // Marquer comme initialisé quand on reçoit un message (preuve que ça marche)
             if (!isFullyInitialized && isReady && sock?.ws?.readyState === 1) {
                 isFullyInitialized = true;
                 if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
-                console.log('✅ Initialisation confirmée par message reçu\n');
+                
+                console.log('\n' + '🎉'.repeat(25));
+                console.log('  SOCKET PLEINEMENT INITIALISÉ !');
+                console.log('  ✅ Prêt à envoyer/recevoir des messages');
+                console.log('🎉'.repeat(25) + '\n');
+                
                 processQueue();
             }
 
@@ -322,29 +453,46 @@ async function connectWhatsApp() {
                 try {
                     const from = m.key.remoteJid;
                     const body = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
-                    console.log(`📩 ${from}: ${body.substring(0, 50)}`);
+                    console.log(`\n📩 Message reçu de ${from}:`);
+                    console.log(`   "${body.substring(0, 100)}"\n`);
                     
-                    // VOTRE LOGIQUE ICI (ex: auto-réponse)
-                    // if (body === 'ping') await sendMessageSafe(from, { text: 'pong!' });
+                    // ════════════════════════════════════════
+                    // VOTRE LOGIQUE DE TRAITEMENT ICI
+                    // ════════════════════════════════════════
+                    
+                    // Exemple: Auto-réponse simple
+                    /*
+                    if (body.toLowerCase() === 'ping') {
+                        await sendMessageSafe(from, { text: 'pong! 🏓' });
+                    }
+                    else if (body.toLowerCase() === 'heure') {
+                        await sendMessageSafe(from, { text: `Il est ${new Date().toLocaleTimeString('fr-FR')}` });
+                    }
+                    */
                     
                 } catch(e) {
-                    console.error('❌ Msg error:', e.message);
+                    console.error('❌ Erreur traitement message:', e.message);
                 }
             }
         });
 
-        console.log('✅ Socket créé\n');
+        console.log('✅ Socket WhatsApp créé avec succès\n');
+        console.log('⏳ En attente des événements de connexion...\n');
+
         return sock;
 
     } catch(err) {
-        console.error('\n💥 ERREUR:', err.message);
+        console.error('\n' + '💥'.repeat(30));
+        console.error(` ERREUR CRITIQUE: ${err.message}`);
+        console.error('💥'.repeat(30) + '\n');
         
         isBotStarting = false;
         isFullyInitialized = false;
+        pairingCodeRequested = false;
         retryCount++;
         
         const d = getDelay();
-        console.log(`🔄 Retry dans ${(d/1000).toFixed(1)}s\n`);
+        console.error(`🔄 Nouvelle tentative dans ${(d/1000).toFixed(1)}s (retry #${retryCount})\n`);
         setTimeout(connectWhatsApp, d);
         return null;
     }
@@ -355,52 +503,83 @@ async function connectWhatsApp() {
 // ============================================================
 
 async function forceReconnect() {
-    console.log('🔁 Reconnexion forcée...\n');
+    console.log('\n🔁 DÉBUT RECONNEXION FORCÉE PROPRE...\n');
     
     try {
         if (sock) {
+            console.log('   1/4 Suppression listeners...');
             sock.ev.removeAllListeners();
-            if (sock.ws?.readyState === 1) sock.ws.close(4001, 'Force reconnect');
+            
+            if (sock.ws?.readyState === 1) {
+                console.log('   2/4 Fermeture WebSocket...');
+                sock.ws.close(4001, 'Timeout init - Reconnexion forcée');
+            }
         }
-    } catch(e) {}
-    
-    sock = null;
-    isReady = false;
-    isFullyInitialized = false;
-    isBotStarting = false;
-    
-    if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
-    if (reconnectTimeout) { clearTimeout(reconnectTimeout); reconnectTimeout = null; }
-    
-    await sleep(5000);
-    await connectWhatsApp();
+        
+        console.log('   3/4 Reset état global...');
+        sock = null;
+        isReady = false;
+        isFullyInitialized = false;
+        isBotStarting = false;
+        pairingCodeRequested = false;
+        
+        if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
+        if (reconnectTimeout) { clearTimeout(reconnectTimeout); reconnectTimeout = null; }
+        
+        console.log('   4/4 Attente 5s...');
+        await sleep(5000);
+        
+        console.log('🚀 Relancement connexion...\n');
+        await connectWhatsApp();
+        
+    } catch(err) {
+        console.error('❌ Erreur reconnexion forcée:', err.message);
+        retryCount++;
+        setTimeout(connectWhatsApp, getDelay());
+    }
 }
 
+/**
+ * Envoie un message de manière sécurisée
+ */
 async function sendMessageSafe(jid, message) {
     if (!isFullyInitialized || !sock || sock.ws?.readyState !== 1) {
         sendQueue.push({ jid, message, time: Date.now() });
-        console.log(`📤 Enfilé → ${jid}`);
+        console.log(`📤 Message enfilé (${sendQueue.length} en attente) → ${jid}`);
         return null;
     }
 
     try {
+        console.log(`\n📤 ENVOI → ${jid}`);
+        
         const result = await Promise.race([
             sock.sendMessage(jid, message),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 20000))
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout après 20s')), 20000)
+            )
         ]);
-        console.log(`✅ Envoyé → ${jid}`);
+        
+        console.log(`✅ MESSAGE ENVOYÉ AVEC SUCCÈS !`);
+        console.log(`   ID: ${result?.key?.id}\n`);
+        
         return result;
+        
     } catch(err) {
-        console.error(`❌ Échec envoi → ${jid}:`, err.message);
+        console.error(`❌ ÉCHEC ENVOI vers ${jid}:`);
+        console.error(`   ${err.message}\n`);
+        
         sendQueue.push({ jid, message, time: Date.now() });
         return null;
     }
 }
 
+/**
+ * Traite la file d'attente des messages
+ */
 function processQueue() {
     if (sendQueue.length === 0 || !isFullyInitialized) return;
     
-    console.log(`\n📬 File d'attente: ${sendQueue.length} message(s)\n`);
+    console.log(`\n📬 Traitement file d'attante: ${sendQueue.length} message(s)\n`);
     
     while (sendQueue.length > 0) {
         const item = sendQueue.shift();
@@ -413,37 +592,43 @@ function processQueue() {
 // ============================================================
 
 async function start() {
-    console.log('\n' + '🚀'.repeat(30));
-    console.log(' WHATSAPP BOT - DÉMARRAGE');
-    console.log('🚀'.repeat(30));
-    console.log(`⏰ ${new Date().toISOString()}\n`);
+    console.log('\n' + '🚀'.repeat(35));
+    console.log('  WHATSAPP BOT v3.2 - DÉMARRAGE');
+    console.log('🚀'.repeat(35));
+    console.log(`\n⏰ Heure: ${new Date().toISOString()}`);
+    console.log(`🎯 Version: Compatible Baileys 6.7.9`);
+    console.log(`📍 Env: ${process.env.NODE_ENV || 'development'}\n`);
 
-    // Démarrer serveur HTTP (CRITIQUE pour Render)
+    // Serveur HTTP (CRITIQUE pour Render/heroku)
     const server = app.listen(CONFIG.PORT, () => {
-        console.log(`🌐 Serveur: http://localhost:${CONFIG.PORT}\n`);
+        console.log(`🌐 Serveur HTTP démarré sur port ${CONFIG.PORT}`);
+        console.log(`   • Health: http://localhost:${CONFIG.PORT}/api/health`);
+        console.log(`   • Send:   http://localhost:${CONFIG.PORT}/api/send`);
+        console.log(`   • QR:     http://localhost:${CONFIG.PORT}/api/qr\n`);
     });
 
-    server.keepAliveTimeout = 120000;
+    server.keepAliveTimeout = 120000; // 2 min (important pour Render)
 
-    // Gestion signaux
-    process.on('SIGTERM', () => { console.log('👋 SIGTERM'); process.exit(0); });
-    process.on('SIGINT', () => { console.log('👋 SIGINT'); process.exit(0); });
+    // Gestion signaux système
+    process.on('SIGTERM', () => { console.log('\n👋 SIGTERM reçu'); process.exit(0); });
+    process.on('SIGINT', () => { console.log('\n👋 SIGINT reçu'); process.exit(0); });
     
     // Ne pas crasher sur erreurs non gérées
-    process.on('unhandledRejection', (r) => console.error('💥 Unhandled:', r));
-    process.on('uncaughtException', (e) => console.error('💥 Uncaught:', e.message));
+    process.on('unhandledRejection', (r) => console.error('💥 Unhandled Rejection:', r));
+    process.on('uncaughtException', (e) => console.error('💥 Uncaught Exception:', e.message));
 
     // Démarrer WhatsApp
     await connectWhatsApp();
 
-    // Health check périodique
+    // Health check périodique (toutes les 5 min)
     setInterval(() => {
-        const state = isFullyInitialized ? '✅' : isReady ? '⚠️' : '❌';
-        console.log(`${new Date().toISOString()} | ${state} | Queue: ${sendQueue.length}`);
+        const status = isFullyInitialized ? '✅ OK' : isReady ? '⚠️ DEGRADED' : '❌ DOWN';
+        const queueInfo = sendQueue.length > 0 ? ` | Queue: ${sendQueue.length}` : '';
+        console.log(`${new Date().toISOString()} | ${status}${queueInfo}`);
     }, 300000);
 
-    console.log('✅ Système prêt !\n');
+    console.log('✨ Système prêt et en attente de connexions...\n');
 }
 
-// LANCER
+// LANCER LE TOUT
 start();
