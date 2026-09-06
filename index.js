@@ -1,1334 +1,975 @@
-/**
- * WHATSAPP BOT v3.2.2 - RENDER OPTIMIZED ULTIMATE (CORRIGÉ)
- * 
- * ✅ Corrections v3.2.2 :
- * - Code orphelin supprimé (handlers en dehors de fonction)
- * - Redéclaration pairingCodeRequested corrigée
- * - currentQR / qrGeneratedAt mis à jour correctement
- * - Sauvegarde bulk job corrigée (findOneAndUpdate par jobId)
- * - currentIndex mis à jour AVANT envoi (évite doublons)
- * - Status final n'écrase plus 'cancelled'
- * - Timeout ajouté dans boucle d'attente reconnexion
- * - sock.end() remplacé par sock.ws?.close()
- * - reconnectTimeout stocké et nettoyé
- * - Gestion DisconnectReason.loggedOut
- * - startIndex ajouté au schéma Mongoose
- */
+// ============================================================
+// 🔐 WHATSAPP BOT - VERSION PRODUCTION STABLE v3.0
+// ✅ Corrigé: Timeout chats.js, envoi messages, reconnexion
+// ============================================================
 
-const { 
-    default: makeWASocket, 
-    initAuthCreds, 
-    BufferJSON, 
-    DisconnectReason,
-    proto,
-    makeCacheableSignalKeyStore,
-    useMultiFileAuthState
-} = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
-const QRCode = require('qrcode');
-const express = require('express');
+require('dotenv').config();
 const mongoose = require('mongoose');
+const { 
+    makeWASocket, 
+    useMongoDBAuthState, 
+    DisconnectReason,
+    delay,
+    makeCacheableSignalKeyStore,
+    proto
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
+const { Boom } = require('@hapi/boom');
 
-const app = express();
-app.use(express.json({ limit: '5mb' }));
+// ============================================================
+// ⚙️ CONFIGURATION
+// ============================================================
 
-// ==================== MIDDLEWARES ====================
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
-});
-
-// ==================== CONFIGURATION ====================
-const PORT = process.env.PORT || 10000;
-const MONGO_URI = process.env.MONGO_URI;
-
-// ⭐ CONFIGURATION TIMEOUTS POUR RENDER
-const TIMEOUT_CONFIG = {
-    BASE_CONNECT_TIMEOUT: 120000,
-    BASE_QUERY_TIMEOUT: 120000,
-    MAX_TIMEOUT: 180000,
-    KEEP_ALIVE_INTERVAL: 25000,
-    RETRY_DELAY_BASE: 10000,
-    RETRY_DELAY_MAX: 60000,
-    MAX_RETRIES: 5
+const CONFIG = {
+    MONGO_URI: process.env.MONGO_URI || 'mongodb://localhost:27017/whatsapp_bot',
+    PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
+    
+    TIMEOUTS: {
+        MAX_RETRIES: 10,
+        CONNECT_MS: 300000,       // 5 min
+        QUERY_MS: 600000,         // 10 min (CRITIQUE pour chats.js)
+        KEEPALIVE_MS: 45000,      // 45s
+        INIT_MAX_WAIT_MS: 90000,  // 90s max pour l'init (après: reconnexion)
+        SEND_MESSAGE_TIMEOUT_MS: 20000, // 20s timeout par message envoyé
+    },
+    
+    RETRY: {
+        BASE_DELAY_MS: 15000,     // 15s
+        MAX_DELAY_MS: 300000,     // 5 min
+        BACKOFF_FACTOR: 2,
+        JITTER_PERCENT: 0.25      // ±25%
+    }
 };
-const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '2290140443431';
 
-// ==================== VARIABLES GLOBALES ====================
+// ============================================================
+// 📦 ÉTAT GLOBAL
+// ============================================================
+
 let sock = null;
-let isReady = false;
-let connectionOpenCount = 0;
 let isBotStarting = false;
-let reconnectTimeout = null;
+let isReady = false;
+let isFullyInitialized = false;  // ⭐ NOUVEAU : Track si l'init est COMPLÈTE
 let retryCount = 0;
+let reconnectTimeout = null;
+let pairingCodeRequested = false;
 let currentQR = null;
 let qrGeneratedAt = null;
-let pairingCodeRequested = false;
+let connectionOpenCount = 0;
+let initTimeoutHandle = null;     // ⭐ Pour forcer la reconnexion si init trop longue
+let lastMessageSentTime = null;   // ⭐ Suivi des envois
+let sendQueue = [];               // ⭐ File d'attente des messages pendant reconnexion
 
-// ==================== MODÈLE MONGODB ====================
-const AuthSchema = new mongoose.Schema({
-    _id: { type: String, required: true },
-    data: { type: String, required: true }
-});
-const AuthModel = mongoose.models.AuthState || mongoose.model('AuthState', AuthSchema);
-
-const BulkJobSchema = new mongoose.Schema({
-    jobId: { type: String, unique: true },
-    items: [{ number: String, message: String }],
-    currentIndex: { type: Number, default: 0 },
-    startIndex: { type: Number, default: 0 },
-    sentCount: { type: Number, default: 0 },
-    failedCount: { type: Number, default: 0 },
-    results: [{
-        number: String,
-        jid: String,
-        status: String,
-        id_message: String,
-        error: String,
-        timestamp: Date
-    }],
-    status: { 
-        type: String, 
-        enum: ['pending', 'running', 'completed', 'cancelled', 'paused_daily_limit', 'failed'],
-        default: 'pending'
-    },
-    cancelled: { type: Boolean, default: false },
-    config: {
-        minDelaySec: Number,
-        maxDelaySec: Number,
-        batchSize: Number,
-        batchPauseMinutes: Number,
-        dailyLimit: Number
-    },
-    sentToday: { type: Number, default: 0 },
-    currentDay: String,
-    startedAt: Date,
-    finishedAt: Date,
-    nextSendAt: Date,
-    createdAt: { type: Date, default: Date.now }
-}, { collection: 'bulkjobs' });
-
-const BulkJobModel = mongoose.models.BulkJob || mongoose.model('BulkJob', BulkJobSchema);
-let bulkJob = null;
-let isProcessing = false;
-
-// ==================== AUTH MONGODB ====================
-async function useMongoDBAuthState() {
-    console.log('📦 Initialisation auth MongoDB...');
-    
-    const readData = async (id) => {
-        try {
-            const doc = await AuthModel.findById(id).lean().maxTimeMS(10000);
-            if (!doc) return undefined;
-            return JSON.parse(doc.data, BufferJSON.reviver);
-        } catch (err) {
-            console.error(`❌ Erreur lecture Mongo (${id}):`, err.message);
-            return undefined;
-        }
-    };
-
-    const writeData = async (id, data) => {
-        try {
-            if (data === undefined || data === null) {
-                await AuthModel.findByIdAndDelete(id);
-            } else {
-                const value = JSON.stringify(data, BufferJSON.replacer);
-                await AuthModel.findByIdAndUpdate(id, { data: value }, { upsert: true, new: true });
-            }
-        } catch (err) {
-            console.error(`❌ Erreur écriture Mongo (${id}):`, err.message);
-        }
-    };
-
-    let creds = await readData('creds');
-    if (!creds) {
-        console.log('🆕 Nouvelle session - Génération creds initiaux...');
-        creds = initAuthCreds();
-    } else {
-        console.log('✅ Session existante chargée depuis MongoDB');
-    }
-
-    const saveCreds = async () => await writeData('creds', creds);
-
-    const keys = {
-        get: async (type, ids) => {
-            const data = {};
-            await Promise.allSettled(ids.map(async (id) => {
-                try {
-                    let value = await readData(`${type}-${id}`);
-                    if (type === 'app-state-sync-key' && value && typeof value === 'object') {
-                        try { value = proto.Message.AppStateSyncKeyData.fromObject(value); } catch(e) {}
-                    }
-                    data[id] = value;
-                } catch (error) {
-                    data[id] = undefined;
-                }
-            }));
-            return data;
-        },
-        
-        set: async (data) => {
-            const tasks = [];
-            for (const category in data) {
-                for (const id in data[category]) {
-                    const value = data[category][id];
-                    const key = `${category}-${id}`;
-                    tasks.push(value ? writeData(key, value) : AuthModel.findByIdAndDelete(key));
-                }
-            }
-            await Promise.allSettled(tasks);
-        }
-    };
-
-    return { state: { creds, keys }, saveCreds };
-}
-
-// ==================== UTILITAIRES ====================
-function formatNumber(rawNumber) {
-    let cleanNumber = String(rawNumber).replace(/[^0-9]/g, '');
-    if (cleanNumber.length === 10 && cleanNumber.startsWith('01')) cleanNumber = '229' + cleanNumber.slice(2);
-    else if (cleanNumber.length === 8) cleanNumber = '229' + cleanNumber;
-    cleanNumber = cleanNumber.replace(/^\+/, '');
-    return `${cleanNumber}@s.whatsapp.net`;
-}
+// ============================================================
+// 🛠️ UTILITAIRES
+// ============================================================
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function randomDelayMs(minSeconds, maxSeconds) {
-    const min = Math.ceil(minSeconds * 1000);
-    const max = Math.floor(maxSeconds * 1000);
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function todayStr() {
-    return new Date().toISOString().slice(0, 10);
-}
-
+/**
+ * Calcule le délai progressif avec backoff exponentiel + jitter
+ */
 function getProgressiveDelay() {
-    const delay = Math.min(
-        TIMEOUT_CONFIG.RETRY_DELAY_BASE * Math.pow(1.5, retryCount),
-        TIMEOUT_CONFIG.RETRY_DELAY_MAX
-    );
-    return Math.round(delay);
+    const { BASE_DELAY_MS, MAX_DELAY_MS, BACKOFF_FACTOR, JITTER_PERCENT } = CONFIG.RETRY;
+    
+    let delay = BASE_DELAY_MS * Math.pow(BACKOFF_FACTOR, retryCount);
+    delay = Math.min(delay, MAX_DELAY_MS);
+    
+    // Ajouter du jitter
+    const jitter = delay * JITTER_PERCENT * (Math.random() * 2 - 1);
+    delay = Math.round(delay + jitter);
+    
+    return Math.max(delay, BASE_DELAY_MS); // Minimum 15s
 }
 
-function getAdaptiveTimeout() {
-    const timeout = Math.min(
-        TIMEOUT_CONFIG.BASE_CONNECT_TIMEOUT + (retryCount * 15000),
-        TIMEOUT_CONFIG.MAX_TIMEOUT
-    );
-    return Math.round(timeout);
+/**
+ * Vérifie la santé complète du socket
+ */
+function checkSocketHealth() {
+    const health = {
+        timestamp: new Date().toISOString(),
+        healthy: false,
+        ready: false,
+        fullyInitialized: false,
+        canSend: false,
+        
+        details: {
+            hasSocket: false,
+            wsState: null,
+            wsStateText: 'unknown',
+            hasAuth: false,
+            userId: null,
+            userName: null,
+            retryCount: retryCount,
+            connectionCount: connectionOpenCount,
+            uptime: null,
+            lastMessageSent: lastMessageSentTime
+        }
+    };
+    
+    if (!sock) {
+        return health;
+    }
+    
+    health.details.hasSocket = true;
+    const wsState = sock.ws?.readyState;
+    health.details.wsState = wsState;
+    health.details.wsStateText = {0:'connecting',1:'open',2:'closing',3:'closed'}[wsState] || `unknown(${wsState})`;
+    health.details.hasAuth = !!sock.authState?.creds?.registered;
+    health.details.userId = sock.user?.id || null;
+    health.details.userName = sock.user?.name || null;
+    
+    // Conditions pour être "healthy"
+    health.ready = isReady && wsState === 1;
+    health.fullyInitialized = isFullyInitialized;
+    
+    // Condition CRITIQUE pour pouvoir envoyer
+    health.canSend = health.ready && health.fullyInitialized && health.details.hasAuth;
+    health.healthy = health.canSend;
+    
+    return health;
 }
 
-// ==================== CONFIG RATE LIMITING ====================
-const RATE_CONFIG = {
-    MIN_DELAY_SEC: 8,
-    MAX_DELAY_SEC: 20,
-    BATCH_SIZE: 10,
-    BATCH_PAUSE_MINUTES: 3,
-    LONG_BREAK_EVERY: 40,
-    LONG_BREAK_MIN_MINUTES: 8,
-    LONG_BREAK_MAX_MINUTES: 15,
-    DEFAULT_DAILY_LIMIT: 500,
-    MAX_RETRIES: 3
-};
+/**
+ * Enfile un message à envoyer plus tard (pendant reconnexion)
+ */
+function queueMessage(jid, message, options = {}) {
+    const queuedItem = {
+        jid,
+        message,
+        options,
+        timestamp: Date.now(),
+        attempts: 0
+    };
+    
+    sendQueue.push(queuedItem);
+    console.log(`📤 Message enfilé (${sendQueue.length} en attente) → ${jid}`);
+}
 
-// ==================== CONNEXION WHATSAPP (VERSION CORRIGÉE) ====================
+/**
+ * Traite la file d'attente des messages
+ */
+async function processSendQueue() {
+    if (sendQueue.length === 0 || !canSendMessage()) {
+        return;
+    }
+    
+    console.log(`\n📬 Traitement file d'attente: ${sendQueue.length} message(s)`);
+    
+    const processed = [];
+    const failed = [];
+    
+    while (sendQueue.length > 0) {
+        const item = sendQueue.shift();
+        item.attempts++;
+        
+        try {
+            await sendMessageInternal(item.jid, item.message, item.options);
+            processed.push(item);
+            console.log(`✅ Message traité depuis file → ${item.jid}`);
+            
+            // Petit délai entre les messages pour éviter le rate limiting
+            await sleep(500);
+            
+        } catch (err) {
+            item.error = err.message;
+            
+            if (item.attempts < 3) {
+                // Réessayer plus tard
+                sendQueue.unshift(item);
+                console.log(`⚠️ Échec envoi (tentative ${item.attempts}/3), réessaiera`);
+                break; // Sortir pour éviter boucle infinie
+            } else {
+                failed.push(item);
+                console.error(`❌ Abandon après ${item.attempts} tentatives:`, err.message);
+            }
+        }
+    }
+    
+    if (processed.length > 0) {
+        console.log(`📊 File traitée: ${processed.length} succès, ${failed.length} échecs\n`);
+    }
+}
+
+/**
+ * Vérifie si on peut envoyer des messages maintenant
+ */
+function canSendMessage() {
+    const health = checkSocketHealth();
+    return health.canSend;
+}
+
+// ============================================================
+// 🚀 FONCTION D'ENVOI SÉCURISÉE
+// ============================================================
+
+/**
+ * Envoie un message avec gestion complète d'erreurs et retries
+ * @param {string} jid - Destination (ex: 'xxx@s.whatsapp.net')
+ * @param {object} message - Contenu du message ({ text: '...' })
+ * @param {object} options - Options optionnelles
+ * @returns {Promise<object>} Résultat de l'envoi
+ */
+async function sendMessage(jid, message, options = {}) {
+    // Validation des paramètres
+    if (!jid || typeof jid !== 'string') {
+        throw new Error('JID invalide ou manquant');
+    }
+    
+    if (!message || typeof message !== 'object') {
+        throw new Error('Message invalide ou manquant');
+    }
+    
+    // Si pas prêt, enfiler pour plus tard
+    if (!canSendMessage()) {
+        console.log(`⏳ Socket pas prêt - Message enfilé pour ${jid}`);
+        queueMessage(jid, message, options);
+        return { queued: true, jid, timestamp: Date.now() };
+    }
+    
+    return sendMessageInternal(jid, message, options);
+}
+
+/**
+ * Implémentation interne de l'envoi (sans vérification de readiness)
+ */
+async function sendMessageInternal(jid, message, options = {}) {
+    const { SEND_MESSAGE_TIMEOUT_MS } = CONFIG.TIMEOUTS;
+    
+    console.log(`\n📤 ENVOI MESSAGE → ${jid}`);
+    console.log(`   Type: ${Object.keys(message)[0] || 'unknown'}`);
+    console.log(`   Timeout: ${SEND_MESSAGE_TIMEOUT_MS / 1000}s`);
+    
+    try {
+        // Race entre l'envoi et un timeout
+        const result = await Promise.race([
+            sock.sendMessage(jid, message, options),
+            new Promise((_, reject) => 
+                setTimeout(
+                    () => reject(new Error(`Timeout envoi après ${SEND_MESSAGE_TIMEOUT_MS / 1000}s`)),
+                    SEND_MESSAGE_TIMEOUT_MS
+                )
+            )
+        ]);
+        
+        // Succès !
+        lastMessageSentTime = new Date().toISOString();
+        
+        console.log(`✅ MESSAGE ENVOYÉ AVEC SUCCÈS !`);
+        console.log(`   ID: ${result?.key?.id || 'N/A'}`);
+        console.log(`   Timestamp: ${lastMessageSentTime}\n`);
+        
+        // Traiter la file d'attente après un envoi réussi
+        setTimeout(processSendQueue, 1000);
+        
+        return result;
+        
+    } catch (err) {
+        console.error(`\n❌ ÉCHEC ENVOI VERS ${jid}:`);
+        console.error(`   Erreur: ${err.message}`);
+        console.error(`   Type: ${err.constructor.name}`);
+        
+        // Analyse de l'erreur et action appropriée
+        await handleSendError(err, jid, message, options);
+        
+        throw err; // Re-throw pour que l'appelant puisse gérer aussi
+    }
+}
+
+/**
+ * Gère les erreurs d'envoi avec logique de récupération
+ */
+async function handleSendError(err, jid, originalMessage, originalOptions) {
+    const msg = err.message || '';
+    const stack = err.stack || '';
+    
+    console.error('\n🔍 ANALYSE ERREUR ENVOI:');
+    
+    if (msg.includes('Timed Out') || msg.includes('timeout')) {
+        console.error('   Type: TIMEOUT');
+        console.error('   Cause: Socket probablement zombie ou réseau lent');
+        console.error('   Action: Marquer socket comme non-initialisé et préparer reconnexion');
+        
+        // Forcer la réinitialisation
+        isFullyInitialized = false;
+        
+        // Si ça arrive plusieurs fois, forcer reconnexion
+        if (retryCount < 3) {
+            console.error('   → Tentative de récupération (reset init state)');
+        } else {
+            console.error('   → Trop de timeouts, reconnexion forcée planifiée');
+            scheduleReconnect();
+        }
+        
+    } else if (msg.includes('Connection Closed') || msg.includes('closed') || msg.includes('not open')) {
+        console.error('   Type: CONNEXION FERMÉE');
+        console.error('   Action: Reconnexion immédiate nécessaire');
+        isReady = false;
+        isFullyInitialized = false;
+        scheduleReconnect();
+        
+    } else if (msg.includes('403') || msg.includes('forbidden')) {
+        console.error('   Type: ACCÈS REFUSÉ');
+        console.error('   Cause: Numéro bloqué ou session invalide');
+        console.error('   Action: Nécessite intervention manuelle');
+        
+    } else if (msg.includes('428') || msg.includes('precondition') || msg.includes('initialization')) {
+        console.error('   Type: INITIALISATION INCOMPLÈTE');
+        console.error('   Cause: Le timeout chats.js a laissé le socket dans état instable');
+        console.error('   Action: Reconnexion forcée recommandée');
+        
+        isFullyInitialized = false;
+        scheduleReconnect();
+        
+    } else {
+        console.error('   Type: INCONNU');
+        console.error(`   Stack: ${stack.substring(0, 300)}`);
+    }
+    
+    console.error('');
+}
+
+/**
+ * Planifie une reconnexion
+ */
+function scheduleReconnect() {
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+    }
+    
+    const delay = getProgressiveDelay();
+    console.log(`\n🔄 RECONNEXION PLANIFIÉE dans ${(delay / 1000).toFixed(1)}s`);
+    
+    reconnectTimeout = setTimeout(() => {
+        connectWhatsApp();
+    }, delay);
+}
+
+// ============================================================
+// 🔌 CONNEXION PRINCIPALE
+// ============================================================
+
 async function connectWhatsApp() {
+    // ----------------------------------------------------------
+    // GUARDS
+    // ----------------------------------------------------------
+    
     if (isBotStarting) {
         console.log('⚠️ Connexion déjà en cours, skip...');
         return null;
     }
     
-    if (retryCount > TIMEOUT_CONFIG.MAX_RETRIES) {
-        console.error(`💥 Max retries atteint (${TIMEOUT_CONFIG.MAX_RETRIES}) - Attente manuelle ou reset`);
+    if (retryCount > CONFIG.TIMEOUTS.MAX_RETRIES) {
+        console.error(`💥 Max retries atteint (${CONFIG.TIMEOUTS.MAX_RETRIES})`);
+        console.error('   → Reset automatique dans 2 minutes...');
+        
         isBotStarting = false;
         
         reconnectTimeout = setTimeout(() => {
             retryCount = 0;
             console.log('🔄 Reset retry count - Nouvelle tentative autorisée');
             connectWhatsApp();
-        }, 60000);
+        }, 120000);
         
         return null;
     }
     
+    // ----------------------------------------------------------
+    // DÉBUT CONNEXION
+    // ----------------------------------------------------------
+    
     isBotStarting = true;
+    isFullyInitialized = false; // Reset
+    
+    // Annuler tout timeout d'init précédent
+    if (initTimeoutHandle) {
+        clearTimeout(initTimeoutHandle);
+        initTimeoutHandle = null;
+    }
     
     try {
-        console.log('\n' + '='.repeat(50));
-        console.log(`🔐 CONNEXION WHATSAPP...`);
-        console.log(`📊 Tentative #${retryCount + 1}/${TIMEOUT_CONFIG.MAX_RETRIES + 1}`);
-        console.log(`⏱️ Timeout configuré: ${getAdaptiveTimeout() / 1000}s`);
-        console.log('='.repeat(50) + '\n');
+        console.log('\n' + '='.repeat(60));
+        console.log(`🔐 CONNEXION WHATSAPP v3.0`);
+        console.log(`📊 Tentative #${retryCount + 1}/${CONFIG.TIMEOUTS.MAX_RETRIES + 1}`);
+        console.log(`🕐 Heure: ${new Date().toISOString()}`);
+        console.log('='.repeat(60) + '\n');
 
+        // ----------------------------------------------------------
+        // MONGODB
+        // ----------------------------------------------------------
+        
         console.log('🗄️ Connexion MongoDB Atlas...');
-        await mongoose.connect(MONGO_URI, {
-            serverSelectionTimeoutMS: 15000,
-            socketTimeoutMS: 60000,
-            maxPoolSize: 10,
-            bufferCommands: false
-        });
+        
+        if (mongoose.connection.readyState !== 1) {
+            await mongoose.connect(CONFIG.MONGO_URI, {
+                serverSelectionTimeoutMS: 30000,
+                socketTimeoutMS: 120000,
+                maxPoolSize: 10,
+                bufferCommands: false,
+                heartbeatFrequencyMS: 10000
+            });
+        }
         console.log('✅ MongoDB connecté !\n');
 
+        // ----------------------------------------------------------
+        // AUTH STATE
+        // ----------------------------------------------------------
+        
         const { state, saveCreds } = await useMongoDBAuthState();
 
+        // ----------------------------------------------------------
+        // NETTOYAGE ANCIEN SOCKET
+        // ----------------------------------------------------------
+        
         if (sock) {
-            console.log('🔄 Fermeture ancienne connexion...');
-            try { 
-                sock.ev.removeAllListeners();
-                sock.ws?.close();
-            } catch(e) { 
-                console.log('⚠️ Erreur fermeture socket:', e.message);
+            console.log('🔄 Nettoyage ancienne connexion...');
+            
+            try {
+                sock.ev.removeAllListeners('connection.update');
+                sock.ev.removeAllListeners('creds.update');
+                sock.ev.removeAllListeners('error');
+                sock.ev.removeAllListeners('messages.upsert');
+                
+                if (sock.ws?.readyState === 1) {
+                    sock.ws.close(1000, 'Reconnexion planifiée');
+                }
+            } catch (e) {
+                console.log('   ⚠️ Erreur cleanup:', e.message);
             }
+            
             sock = null;
             isReady = false;
-            await sleep(3000);
+            isFullyInitialized = false;
+            
+            await sleep(5000);
         }
 
-        // Annuler reconnexion planifiée si existante
         if (reconnectTimeout) {
             clearTimeout(reconnectTimeout);
             reconnectTimeout = null;
         }
 
-        console.log('📱 Création socket WhatsApp...');
-        const currentTimeout = getAdaptiveTimeout();
+        // ----------------------------------------------------------
+        // CRÉATION SOCKET
+        // ----------------------------------------------------------
+        
+        console.log('📱 Création socket WhatsApp...\n');
         
         sock = makeWASocket({
             auth: state,
             usePairingCode: true,
+            
+            // ⭐ ANTI-TIMEOUT CHATS.JS
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
             
+            // ⭐ TIMEOUTS OPTIMISÉS POUR RENDER
+            connectTimeoutMs: CONFIG.TIMEOUTS.CONNECT_MS,      // 5 min
+            queryTimeoutMs: CONFIG.TIMEOUTS.QUERY_MS,          // 10 min ⭐⭐⭐
+            keepAliveIntervalMs: CONFIG.TIMEOUTS.KEEPALIVE_MS, // 45s
+            
+            // ⭐ RETRIES
+            retryRequestDelayMs: 10000,
+            maxMsgRetryCount: 5,
+            
+            // ⭐ IDENTITÉ
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             
-            connectTimeoutMs: currentTimeout,
-            keepAliveIntervalMs: TIMEOUT_CONFIG.KEEP_ALIVE_INTERVAL,
-            queryTimeoutMs: currentTimeout,
+            // ⭐ LOGGING
+            logger: pino({ 
+                level: 'warn',
+                transport: {
+                    target: 'pino-pretty',
+                    options: { colorize: true, translateTime: 'SYS:h:MM:ss TT' }
+                }
+            }),
             
-            logger: pino({ level: 'warn' }),
+            // ⭐ OPTIONS
             markOnlineOnConnect: false,
-            retryRequestDelayMs: 5000,
-            maxMsgRetryCount: 3
+            
+            // ⭐ AGENT (optionnel, pour environnements restreints)
+            // agent: require('https').Agent({ keepAlive: true })
         });
 
-        // Sauvegarde des crédentiels
-        sock.ev.on('creds.update', saveCreds);
+        // ----------------------------------------------------------
+        // EVENT LISTENERS
+        // ----------------------------------------------------------
+        
+        // 💾 Créds
+        sock.ev.on('creds.update', async (creds) => {
+            try {
+                await saveCreds(creds);
+            } catch (e) {
+                console.error('❌ Erreur sauvegarde creds:', e.message);
+            }
+        });
 
-        // Gestion connection.update
+        // 📡 Connection updates
+        let connectionErrorHandled = false;
+        
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
-            // Mise à jour du QR pour la route /qr
+            // QR Code
             if (qr) {
                 currentQR = qr;
                 qrGeneratedAt = Date.now();
+                console.log('📷 QR Code généré');
             }
 
-            // N'exécute la demande de code QU'UNE SEULE FOIS
+            // Pairing code (une seule fois)
             if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
                 pairingCodeRequested = true;
-                await sleep(3000);
+                await sleep(5000);
 
                 try {
-                    const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
+                    const cleanNumber = CONFIG.PAIRING_NUMBER.replace(/[^0-9]/g, '');
+                    
+                    if (!cleanNumber || cleanNumber.length < 10) {
+                        throw new Error(`Numéro invalide: ${CONFIG.PAIRING_NUMBER}`);
+                    }
+                    
                     const code = await sock.requestPairingCode(cleanNumber);
                     
-                    console.log('\n' + '='.repeat(40));
+                    console.log('\n' + '='.repeat(50));
                     console.log(`📱 NUMÉRO CIBLE : ${cleanNumber}`);
-                    console.log(`🔑 CODE D'APPAIRAGE UNIQUE : ${code}`);
-                    console.log('='.repeat(40) + '\n');
+                    console.log(`🔑 CODE D'APPAIRAGE : ${code}`);
+                    console.log('='.repeat(50) + '\n');
+                    
                 } catch (err) {
-                    console.error('❌ Erreur génération Pairing Code:', err.message);
+                    console.error('❌ Erreur pairing code:', err.message);
                     pairingCodeRequested = false;
                 }
             }
 
+            // Connexion fermée
             if (connection === 'close') {
                 isReady = false;
+                isFullyInitialized = false;
                 isBotStarting = false;
                 pairingCodeRequested = false;
                 currentQR = null;
                 qrGeneratedAt = null;
+                connectionErrorHandled = false;
+                
+                // Annuler timeout d'init
+                if (initTimeoutHandle) {
+                    clearTimeout(initTimeoutHandle);
+                    initTimeoutHandle = null;
+                }
                 
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const reason = lastDisconnect?.error?.output?.payload?.message || 'Inconnue';
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                console.log(`❌ Connexion fermée (Status: ${statusCode}).`);
+                
+                console.log('\n' + '❌'.repeat(30));
+                console.log(` CONNEXION FERMÉE`);
+                console.log(` Status: ${statusCode || 'N/A'}`);
+                console.log(` Raison: ${reason}`);
+                console.log(` Reconnexion: ${shouldReconnect ? 'OUI ✅' : 'NON ❌'}`);
+                console.log('❌'.repeat(30) + '\n');
                 
                 if (shouldReconnect) {
                     retryCount++;
                     const delay = getProgressiveDelay();
-                    console.log(`🔄 Reconnexion dans ${delay / 1000}s...`);
+                    console.log(`🔄 Reconnexion dans ${(delay / 1000).toFixed(1)}s (retry #${retryCount})\n`);
+                    
                     reconnectTimeout = setTimeout(() => connectWhatsApp(), delay);
                 } else {
-                    console.log('⛔ Déconnexion volontaire (logged out) - Pas de reconnexion auto');
+                    console.log('⛔ Logged out - Supprimez auth/ et redémarrez\n');
                     retryCount = 0;
                 }
             }
 
+            // Connexion ouverte ✅
             if (connection === 'open') {
                 isReady = true;
                 isBotStarting = false;
                 retryCount = 0;
+                connectionErrorHandled = false;
                 connectionOpenCount++;
                 currentQR = null;
                 qrGeneratedAt = null;
-                console.log('\n✅ CONNEXION WHATSAPP RÉUSSIE !\n');
+                
+                // ⭐ IMPORTANT: Ne PAS marquer fullyInitialized ici encore
+                // On attend de voir si l'init se passe bien
+                
+                const userJid = sock.user?.id || 'inconnu';
+                const userName = sock.user?.name || 'Sans nom';
+                
+                console.log('\n' + '✅'.repeat(30));
+                console.log(` CONNEXION WHATSAPP RÉUSSIE !`);
+                console.log('✅'.repeat(30));
+                console.log(`\n👤 Utilisateur: ${userName}`);
+                console.log(`📱 JID: ${userJid}`);
+                console.log(`🔢 Connexion #: ${connectionOpenCount}`);
+                console.log(`⏰ Heure: ${new Date().toISOString()}`);
+                console.log(`\n⏳ Attente finalisation initialisation...`);
+                console.log(`   (Max ${CONFIG.TIMEOUTS.INIT_MAX_WAIT_MS / 1000}s avant reconnexion si échec)\n`);
+                
+                // ⭐ Planifier un timeout pour l'initialisation
+                // Si après ce délai on n'est pas fullyInitialized, on reconnecte
+                initTimeoutHandle = setTimeout(async () => {
+                    if (!isFullyInitialized && isReady) {
+                        console.warn('\n' + '⚠️'.repeat(35));
+                        console.warn(' ⚠️ INITIALISATION TROP LONGUE ⚠️');
+                        console.warn(' Le socket est connecté mais l\'init semble bloquée');
+                        console.warn(' Stratégie: Reconnexion pour forcer un init propre');
+                        console.warn('⚠️'.repeat(35) + '\n');
+                        
+                        // Forcer reconnexion
+                        isFullyInitialized = false;
+                        await forceCleanReconnect();
+                    }
+                }, CONFIG.TIMEOUTS.INIT_MAX_WAIT_MS); // 90 secondes
             }
         });
 
-        // ✅ Gestion erreurs socket
-        sock.ev.on('error', (error) => {
+        // 🛠️ Gestion erreurs socket
+        sock.ev.on('error', async (error) => {
             const msg = error?.message || '';
             const stack = error?.stack || '';
+            const isErrorInitChats = 
+                stack.includes('chats.js') || 
+                stack.includes('fetchProps') || 
+                stack.includes('executeInitQueries');
             
+            // --- TIMEOUT LORS DE L'INIT DES CHATS ---
+            if ((msg.includes('Timed Out') || stack.includes('Timed Out')) && isErrorInitChats) {
+                if (!connectionErrorHandled) {
+                    connectionErrorHandled = true;
+                    
+                    console.warn('\n' + '⚠️'.repeat(35));
+                    console.warn(' ⚠️ TIMEOUT SYNCHRO CHATS DÉTECTÉ ⚠️');
+                    console.warn('⚠️'.repeat(35));
+                    console.warn('\n📋 Ce timeout rend le socket INSTABLE pour l\'envoi');
+                    console.warn('📋 Action: Reconnexion forcée immédiate\n');
+                    
+                    // Annuler le timeout d'init car on sait déjà que ça a échoué
+                    if (initTimeoutHandle) {
+                        clearTimeout(initTimeoutHandle);
+                        initTimeoutHandle = null;
+                    }
+                    
+                    // ⭐ STRATÉGIE CLÉ: Reconnexion forcée au lieu d'ignorer
+                    // Ignorer l'erreur menait à un socket zombie incapable d'envoyer
+                    await forceCleanReconnect();
+                }
+                return;
+            }
+            
+            // --- AUTRES TIMEOUTS ---
             if (msg.includes('Timed Out') || stack.includes('Timed Out')) {
-                console.warn('⚠️ [TIMEOUT] Erreur timeout socket (normal sur Render)');
+                console.warn('⚠️ [TIMEOUT] Socket timeout (non-critique):');
+                console.warn(`   ${msg.substring(0, 100)}\n`);
+                return;
             }
-            else if (msg.includes('stream') || msg.includes('conflict')) {
-                console.warn('⚠️ [STREAM] Erreur stream (normale sur Render)');
+            
+            // --- STREAM ERRORS (normales) ---
+            if (msg.includes('stream') || msg.includes('conflict') || msg.includes('Stream removed')) {
+                console.warn('⚠️ [STREAM] Erreur stream (normale)\n');
+                return;
             }
-            else if (msg.includes('init queries') || stack.includes('chats.js')) {
-                console.warn('⚠️ [INIT] Erreur initialisation queries (timeout probable)');
+            
+            // --- PRESENCE WARNING (inoffensif) ---
+            if (msg.includes('no name present')) {
+                // Silencieux
+                return;
             }
-            else {
-                console.error('❌ [ERROR] Erreur socket inattendue:');
-                console.error('   Type:', error.constructor.name);
-                console.error('   Message:', msg.substring(0, 150));
+            
+            // --- AUTRES ERREURS ---
+            console.error('❌ [ERROR] Erreur socket:', error.constructor.name);
+            console.error('   Message:', msg.substring(0, 200));
+            if (stack) console.error('   Stack:', stack.substring(0, 200), '\n');
+        });
+
+        // 📨 Messages entrants
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            // Marquer comme initialisé dès qu'on reçoit un message
+            // (preuve que le socket fonctionne)
+            if (!isFullyInitialized && isReady && sock?.ws?.readyState === 1) {
+                console.log('📨 Premier message reçu → Initialisation confirmée fonctionnelle');
+                markAsFullyInitialized();
+            }
+            
+            if (!isReady || !messages) return;
+            
+            try {
+                const realMessages = messages.filter(m => !m.notificationType && !m.key.fromMe);
+                
+                for (const msg of realMessages) {
+                    // Votre logique de traitement ici
+                    await handleIncomingMessage(sock, msg);
+                }
+                
+            } catch (err) {
+                console.error('❌ Erreur traitement message:', err.message);
             }
         });
 
-        console.log('✅ Socket WhatsApp créé avec succès\n');
-        console.log('⏳ Attente des événements de connexion...\n');
+        // ----------------------------------------------------------
+        // FIN CRÉATION SOCKET
+        // ----------------------------------------------------------
+        
+        console.log('✅ Socket créé - Attente événements...\n');
 
         return sock;
 
     } catch (err) {
-        console.error('\n' + '💥'.repeat(25));
-        console.log(' ERREUR CRITIQUE LORS DE LA CRÉATION DU SOCKET');
-        console.log('💥'.repeat(25) + '\n');
-        
-        console.error('Type d\'erreur:', err.constructor.name);
-        console.error('Message:', err.message);
-        console.error('');
+        console.error('\n' + '💥'.repeat(35));
+        console.error(` ERREUR CRITIQUE: ${err.message}`);
+        console.error('💥'.repeat(35) + '\n');
         
         isBotStarting = false;
+        isFullyInitialized = false;
         pairingCodeRequested = false;
         retryCount++;
         
         const delay = getProgressiveDelay();
-        console.log(`🔄 Planification nouvelle tentative dans ${delay / 1000}s (retry #${retryCount})\n`);
+        console.error(`🔄 Retry dans ${(delay / 1000).toFixed(1)}s (#${retryCount})\n`);
         
         setTimeout(() => connectWhatsApp(), delay);
-        
         return null;
     }
 }
 
+// ============================================================
+// 🔧 FONCTIONS AUXILIAIRES CRITIQUES
+// ============================================================
 
-// ==================== PROCESSING BULK JOB ====================
-async function processBulkJob() {
-    if (!bulkJob || isProcessing) return;
-    
-    isProcessing = true;
-    bulkJob.status = 'running';
-    
-    console.log('\n' + '🚀'.repeat(25));
-    console.log(' DÉMARRAGE ENVOI BULK MESSAGES');
-    console.log('🚀'.repeat(25) + `\n`);
-    console.log(`📊 Total messages: ${bulkJob.items.length}`);
-    console.log(`⏱️ Délai configuré: ${bulkJob.config?.minDelaySec || RATE_CONFIG.MIN_DELAY_SEC}s - ${bulkJob.config?.maxDelaySec || RATE_CONFIG.MAX_DELAY_SEC}s`);
-
-    try {
-        for (let i = bulkJob.currentIndex; i < bulkJob.items.length; i++) {
-            // Vérification annulation
-            if (bulkJob.cancelled) {
-                bulkJob.status = 'cancelled';
-                console.log('\n🛑 Job annulé par utilisateur');
-                break;
-            }
-
-            // Attente connexion active
-            while (!isReady && !bulkJob.cancelled) {
-                console.log('⏳ Attente reconnexion WhatsApp...');
-                await sleep(15000);
-                
-                if (!sock) {
-                    console.log('⚠️ Socket indisponible - En attente...');
-                    continue;
-                }
-            }
-            
-            if (bulkJob.cancelled) break;
-
-            // Gestion limite quotidienne
-            if (todayStr() !== bulkJob.currentDay) {
-                bulkJob.currentDay = todayStr();
-                bulkJob.sentToday = 0;
-            }
-
-            const dailyLimit = bulkJob.config?.dailyLimit || RATE_CONFIG.DEFAULT_DAILY_LIMIT;
-            if (bulkJob.sentToday >= dailyLimit) {
-                console.log(`\n⏸️ Limite quotidienne atteinte (${dailyLimit} messages)`);
-                console.log('   Pause jusqu\'à demain ou reset manuel...\n');
-                
-                bulkJob.status = 'paused_daily_limit';
-                
-                try { 
-                    await BulkJobModel.findByIdAndUpdate(bulkJob.jobId, bulkJob); 
-                } catch(e) {}
-                
-                await sleep(15 * 60 * 1000); // 15 minutes
-                
-                if (!bulkJob.cancelled) {
-                    bulkJob.sentToday = 0;
-                    bulkJob.status = 'running';
-                    console.log('▶️ Reprise après pause quotidienne\n');
-                }
-            }
-
-            const item = bulkJob.items[i];
-            bulkJob.currentIndex = i;
-
-            try {
-                const jid = formatNumber(item.number);
-                
-                // Simulation comportement humain
-                try {
-                    await sock.sendPresenceUpdate('composing', jid);
-                    await sleep(1500 + Math.floor(Math.random() * 2500));
-                    await sock.sendPresenceUpdate('paused', jid);
-                } catch(e) {
-                    // Ignorer les erreurs de présence
-                }
-
-                const progressText = `[${i+1}/${bulkJob.items.length}]`;
-                console.log(`📤 ${progressText} → ${item.number}`);
-
-                // Envoi avec timeout de sécurité
-                const sendPromise = sock.sendMessage(jid, { text: item.message });
-                const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Send timeout')), 30000)
-                );
-                
-                const result = await Promise.race([sendPromise, timeoutPromise]);
-                
-                bulkJob.results.push({ 
-                    number: item.number, 
-                    jid, 
-                    status: 'success', 
-                    id_message: result?.key?.id, 
-                    timestamp: new Date() 
-                });
-                bulkJob.sentCount++;
-                bulkJob.sentToday++;
-
-                // Sauvegarde périodique (tous les 10 messages)
-                if (bulkJob.sentCount % 10 === 0) {
-                    try { 
-                        await BulkJobModel.findByIdAndUpdate(bulkJob.jobId, bulkJob); 
-                        console.log(`   💾 Sauvegarde intermédiaire (${bulkJob.sentCount} envoyés)`);
-                    } catch(e) {}
-
-                    // Log de progression toutes les 50 messages
-                    if (bulkJob.sentCount % 50 === 0) {
-                        const percent = ((i + 1) / bulkJob.items.length * 100).toFixed(1);
-                        console.log(`\n📊 Progression: ${percent}% (${i+1}/${bulkJob.items.length})\n`);
-                    }
-                }
-
-            } catch (error) {
-                const errorMsg = error?.message || 'Erreur inconnue';
-                console.error(`   ❌ Échec envoi à ${item.number}: ${errorMsg}`);
-                
-                bulkJob.results.push({ 
-                    number: item.number, 
-                    status: 'error', 
-                    error: errorMsg, 
-                    timestamp: new Date() 
-                });
-                bulkJob.failedCount++;
-                
-                // Pause supplémentaire en cas d'erreur de connexion
-                if (errorMsg.toLowerCase().includes('timeout') || 
-                    errorMsg.toLowerCase().includes('disconnect') ||
-                    errorMsg.toLowerCase().includes('connection')) {
-                    console.log('   ⏳ Pause 10s suite à erreur de connexion...');
-                    await sleep(10000);
-                }
-            }
-
-            // Délai entre messages (rate limiting intelligent)
-            if (i < bulkJob.items.length - 1) {
-                const msgsSinceStart = i - (bulkJob.startIndex || 0) + 1;
-                let delayMs;
-                let delayReason = '';
-                
-                // Longue pause tous les X messages
-                if (msgsSinceStart > 0 && msgsSinceStart % RATE_CONFIG.LONG_BREAK_EVERY === 0) {
-                    const longBreakMin = RATE_CONFIG.LONG_BREAK_MIN_MINUTES;
-                    const longBreakMax = RATE_CONFIG.LONG_BREAK_MAX_MINUTES;
-                    const randomLongBreak = longBreakMin + Math.random() * (longBreakMax - longBreakMin);
-                    delayMs = randomLongBreak * 60000;
-                    delayReason = `☕ Longue pause (${randomLongBreak.toFixed(1)}min)`;
-                }
-                // Pause batch
-                else if (bulkJob.config?.batchSize && msgsSinceStart % bulkJob.config.batchSize === 0) {
-                    const batchPause = bulkJob.config.batchPauseMinutes || RATE_CONFIG.BATCH_PAUSE_MINUTES;
-                    delayMs = batchPause * 60000;
-                    delayReason = `📦 Pause batch (${batchPause}min)`;
-                }
-                // Délai normal aléatoire
-                else {
-                    const minDel = bulkJob.config?.minDelaySec || RATE_CONFIG.MIN_DELAY_SEC;
-                    const maxDel = bulkJob.config?.maxDelaySec || RATE_CONFIG.MAX_DELAY_SEC;
-                    delayMs = randomDelayMs(minDel, maxDel);
-                    delayReason = `⏱️ Délai normal (${(delayMs/1000).toFixed(1)}s)`;
-                }
-                
-                if (delayReason) {
-                    console.log(`   ${delayReason}`);
-                }
-                
-                await sleep(delayMs);
-            }
+/**
+ * Marque le socket comme pleinement initialisé et prêt pour l'envoi
+ */
+function markAsFullyInitialized() {
+    if (!isFullyInitialized) {
+        isFullyInitialized = true;
+        
+        // Annuler le timeout d'init si présent
+        if (initTimeoutHandle) {
+            clearTimeout(initTimeoutHandle);
+            initTimeoutHandle = null;
         }
-
-        // Finalisation
-        bulkJob.status = 'completed';
-        bulkJob.finishedAt = new Date();
         
-        // Sauvegarde finale
-        try { 
-            await BulkJobModel.findByIdAndUpdate(bulkJob.jobId, bulkJob); 
-        } catch(e) {}
+        console.log('\n' + '🎉'.repeat(25));
+        console.log('  SOCKET PLEINEMENT INITIALISÉ !');
+        console.log('  ✅ Prêt à envoyer/recevoir des messages');
+        console.log('🎉'.repeat(25) + '\n');
         
-        console.log('\n' + '✅'.repeat(25));
-        console.log(' ENVOI BULK TERMINÉ AVEC SUCCÈS !');
-        console.log('✅'.repeat(25));
-        console.log(`\n📊 RÉCAPITULATIF:`);
-        console.log(`   ✅ Messages envoyés: ${bulkJob.sentCount}`);
-        console.log(`   ❌ Messages échoués: ${bulkJob.failedCount}`);
-        console.log(`   📈 Taux de réussite: ${((bulkJob.sentCount / bulkJob.items.length) * 100).toFixed(1)}%`);
-        console.log(`   ⏰ Durée totale: ${Math.round((Date.now() - new Date(bulkJob.startedAt).getTime()) / 1000)} secondes\n`);
-
-    } catch (error) {
-        console.error('\n' + '💥'.repeat(25));
-        console.log(' ERREUR CRITIQUE LORS DU TRAITEMENT');
-        console.log('💥'.repeat(25) + '\n');
-        console.error(error);
-        
-        bulkJob.status = 'failed';
-        
-        try { 
-            await BulkJobModel.findByIdAndUpdate(bulkJob.jobId, bulkJob); 
-        } catch(e) {}
-        
-    } finally {
-        isProcessing = false;
+        // Traiter la file d'attente des messages en retard
+        setTimeout(processSendQueue, 2000);
     }
 }
 
-// ==================== ROUTES API ====================
-
-// Affichage du QR code sous forme d'image (plus fiable que l'ASCII dans les logs)
-app.get('/qr', async (req, res) => {
-    if (isReady) {
-        return res.send(`
-            <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-                <h2>✅ Bot déjà connecté</h2>
-                <p>Aucun QR à scanner — le bot est déjà lié à WhatsApp.</p>
-            </body></html>
-        `);
-    }
-
-    if (!currentQR) {
-        return res.send(`
-            <html><head><meta http-equiv="refresh" content="3"></head>
-            <body style="font-family:sans-serif;text-align:center;padding:40px">
-                <h2>⏳ En attente du QR...</h2>
-                <p>Rechargement automatique dans 3 secondes.</p>
-            </body></html>
-        `);
-    }
-
-    const ageSeconds = Math.round((Date.now() - qrGeneratedAt) / 1000);
-    if (ageSeconds > 18) {
-        return res.send(`
-            <html><head><meta http-equiv="refresh" content="2"></head>
-            <body style="font-family:sans-serif;text-align:center;padding:40px">
-                <h2>⌛ QR expiré, régénération...</h2>
-                <p>Rechargement automatique dans 2 secondes.</p>
-            </body></html>
-        `);
-    }
-
+/**
+ * Force une reconnexion propre (fermeture + recréation)
+ */
+async function forceCleanReconnect() {
+    console.log('\n🔁 DÉBUT RECONNEXION FORCÉE PROPRE...');
+    
     try {
-        const qrImage = await QRCode.toDataURL(currentQR, { width: 400, margin: 2 });
-        res.send(`
-            <html><head><meta http-equiv="refresh" content="5"></head>
-            <body style="font-family:sans-serif;text-align:center;padding:40px">
-                <h2>📸 Scannez ce QR code</h2>
-                <img src="${qrImage}" alt="QR Code WhatsApp" style="border:4px solid #333;border-radius:8px" />
-                <p>WhatsApp > Paramètres > Appareils liés > Lier un appareil</p>
-                <p style="color:#888">Actualisation automatique toutes les 5s — âge du QR : ${ageSeconds}s</p>
-            </body></html>
-        `);
-    } catch (e) {
-        res.status(500).send('Erreur génération QR: ' + e.message);
-    }
-});
-
-// ==================== WEBHOOK META (WhatsApp Business Cloud API) ====================
-// Nécessaire pour la vérification de callback lors de la configuration
-// du produit WhatsApp dans Meta Business Manager.
-const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'change_this_token';
-
-app.get('/webhook', (req, res) => {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-
-    if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
-        console.log('✅ Webhook Meta vérifié avec succès');
-        return res.status(200).send(challenge);
-    }
-    console.log('❌ Échec de vérification webhook Meta (token attendu vs reçu ne correspondent pas)');
-    return res.sendStatus(403);
-});
-
-app.post('/webhook', (req, res) => {
-    // Accuse réception immédiatement (Meta exige une réponse 200 rapide).
-    // Le contenu (statuts de livraison, messages entrants) n'est pas encore traité,
-    // juste loggé pour l'instant.
-    console.log('📩 Événement webhook Meta reçu:', JSON.stringify(req.body).substring(0, 300));
-    res.sendStatus(200);
-});
-
-// Health check simple
-app.get('/ping', (req, res) => res.status(200).send('pong'));
-
-// Health check détaillé
-app.get('/health', (req, res) => {
-    const healthStatus = {
-        status: isReady ? 'healthy' : 'degraded',
-        whatsapp: { 
-            connected: isReady, 
-            connections: connectionOpenCount,
-            retryCount: retryCount,
-            socketExists: !!sock,
-            user: sock?.user?.id ? sock.user.id.split(':')[0] : null
-        },
-        system: { 
-            uptime: Math.round(process.uptime()),
-            memory: {
-                used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-                total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
-            },
-            nodeVersion: process.version,
-            platform: `${process.platform} ${process.arch}`
-        },
-        mongodb: {
-            connected: mongoose.connection.readyState === 1,
-            state: ['disconnected', 'connected', 'connecting', 'disconnecting'][mongoose.connection.readyState] || 'unknown'
-        },
-        job: bulkJob ? { 
-            id: bulkJob.jobId, 
-            status: bulkJob.status, 
-            sent: bulkJob.sentCount,
-            total: bulkJob.items?.length || 0,
-            progress: bulkJob.items?.length > 0 ? 
-                ((bulkJob.currentIndex + 1) / bulkJob.items.length * 100).toFixed(1) + '%' : '0%'
-        } : null,
-        config: {
-            currentTimeout: `${getAdaptiveTimeout() / 1000}s`,
-            nextRetryDelay: `${getProgressiveDelay() / 1000}s`,
-            maxRetries: TIMEOUT_CONFIG.MAX_RETRIES
-        },
-        timestamp: new Date().toISOString(),
-        version: '3.2.1'
-    };
-    
-    res.status(isReady ? 200 : 503).json(healthStatus);
-});
-
-// Route racine
-app.get('/', (req, res) => {
-    res.json({
-        service: 'WhatsApp Bot',
-        version: '3.2.1 (Render Optimized Ultimate)',
-        status: isReady ? '🟢 Connected' : '🟡 Waiting QR',
-        description: 'API WhatsApp avec bulk messaging, rate limiting et persistance MongoDB',
-        features: [
-            '✅ Anti-timeout 408 (Render compatible)',
-            '✅ Anti-boucle infinie',
-            '✅ Retry intelligent progressif',
-            '✅ Bulk messaging optimisé',
-            '✅ Rate limiting humain',
-            '✅ Persistance MongoDB',
-            '✅ Gestion QR code améliorée'
-        ],
-        endpoints: {
-            health: { method: 'GET', path: '/health', description: 'Statut détaillé du système' },
-            ping: { method: 'GET', path: '/ping', description: 'Health check simple' },
-            sendMessage: { method: 'POST', path: '/send-message', description: 'Envoyer un message simple' },
-            sendBulk: { method: 'POST', path: '/send-bulk-messages', description: 'Démarrer un envoi bulk' },
-            status: { method: 'GET', path: '/bulk-status', description: 'Statut du job en cours' },
-            cancel: { method: 'POST', path: '/bulk-cancel', description: 'Annuler le job en cours' },
-            resetAuth: { method: 'GET', path: '/reset-auth', description: 'Réinitialiser l\'authentification' },
-            checkAuth: { method: 'GET', path: '/check-auth', description: 'Vérifier l\'état de l\'auth' }
-        },
-        quickStart: {
-            step1: 'Visitez /health pour vérifier la connexion',
-            step2: 'Si "waiting_qr", scannez le QR code dans les logs Render',
-            step3: 'Utilisez POST /send-message pour tester',
-            step4: 'Utilisez POST /send-bulk-messages pour les envois multiples'
-        }
-    });
-});
-
-// Envoi message simple
-app.post('/send-message', async (req, res) => {
-    if (!isReady || !sock) {
-        return res.status(503).json({ 
-            success: false,
-            error: 'Bot non connecté', 
-            hint: 'Attendez la connexion ou scannez le QR code',
-            status: isReady ? 'degraded' : 'offline',
-            action: 'Vérifiez /health ou les logs Render pour le QR code'
-        });
-    }
-    
-    const rawNumber = req.body.number || req.body.phone;
-    const message = req.body.message || req.body.text;
-    
-    if (!rawNumber || !message) {
-        return res.status(400).json({ 
-            success: false,
-            error: 'Champs requis manquants',
-            required: ['number (ou phone)', 'message (ou text)'],
-            example: {
-                number: '01XXXXXXXX',
-                message: 'Votre message ici'
+        // 1. Nettoyage complet
+        if (sock) {
+            console.log('   1/4 Suppression listeners...');
+            sock.ev.removeAllListeners();
+            
+            if (sock.ws?.readyState === 1) {
+                console.log('   2/4 Fermeture WebSocket...');
+                sock.ws.close(4001, 'Reconnexion forcée après timeout init');
             }
-        });
-    }
-    
-    try {
-        const jid = formatNumber(rawNumber);
-        console.log(`\n📨 Nouvel envoi simple vers ${rawNumber}`);
-        
-        const result = await sock.sendMessage(jid, { text: message });
-        
-        console.log(`✅ Message envoyé avec succès - ID: ${result?.key?.id}\n`);
-        
-        res.json({ 
-            success: true, 
-            jid, 
-            id: result?.key?.id,
-            to: rawNumber,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        console.error('❌ Erreur envoi simple:', error.message);
-        res.status(500).json({ 
-            success: false,
-            error: error.message,
-            hint: 'Vérifiez le format du numéro (01XXXXXXXX ou +229XXXXXXXX)'
-        });
-    }
-});
-
-// Envoi bulk messages
-app.post('/send-bulk-messages', async (req, res) => {
-    if (!isReady || !sock) {
-        return res.status(503).json({ 
-            success: false,
-            error: 'Bot non connecté',
-            hint: 'Connectez d\'abord le bot via QR code',
-            action: 'Vérifiez /health et scannez le QR si nécessaire'
-        });
-    }
-    
-    if (bulkJob && ['running', 'pending'].includes(bulkJob.status)) {
-        return res.status(409).json({ 
-            success: false,
-            error: 'Un job est déjà en cours',
-            currentJob: {
-                id: bulkJob.jobId,
-                status: bulkJob.status,
-                sent: bulkJob.sentCount,
-                total: bulkJob.items?.length || 0
-            },
-            actions: [
-                'Consultez GET /bulk-status pour suivre le job actuel',
-                'Utilisez POST /bulk-cancel pour l\'annuler'
-            ]
-        });
-    }
-    
-    const messages = req.body.messages;
-    if (!Array.isArray(messages) || messages.length === 0) {
-        return res.status(400).json({ 
-            success: false,
-            error: 'Le champ "messages" est requis et doit être un tableau non vide',
-            example: {
-                messages: [
-                    { number: '01XX123456', message: 'Bonjour !' },
-                    { phone: '229XX789012', text: 'Message test' }
-                ]
-            }
-        });
-    }
-    
-    if (messages.length > 1000) {
-        return res.status(400).json({ 
-            success: false,
-            error: 'Limite dépassée: maximum 1000 messages par job',
-            received: messages.length,
-            suggestion: 'Divisez en plusieurs jobs si nécessaire'
-        });
-    }
-    
-    // Création du job
-    const jobId = Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9);
-    
-    bulkJob = {
-        jobId: jobId,
-        items: messages
-            .map(m => ({ 
-                number: m.number || m.phone, 
-                message: m.message || m.text 
-            }))
-            .filter(m => m.number && m.message), // Filtrer entrées invalides
-        currentIndex: 0, 
-        startIndex: 0, 
-        sentCount: 0, 
-        failedCount: 0,
-        results: [], 
-        status: 'pending', 
-        cancelled: false,
-        config: {
-            dailyLimit: Math.min(req.body.dailyLimit || RATE_CONFIG.DEFAULT_DAILY_LIMIT, 1000),
-            batchSize: req.body.batchSize || RATE_CONFIG.BATCH_SIZE,
-            batchPauseMinutes: Math.max(req.body.batchPauseMinutes || RATE_CONFIG.BATCH_PAUSE_MINUTES, 3),
-            minDelaySec: Math.max(req.body.minDelaySeconds || RATE_CONFIG.MIN_DELAY_SEC, 8),
-            maxDelaySec: req.body.maxDelaySeconds || RATE_CONFIG.MAX_DELAY_SEC
-        },
-        sentToday: 0, 
-        currentDay: todayStr(),
-        startedAt: new Date()
-    };
-    
-    // Validation
-    if (bulkJob.items.length === 0) {
-        return res.status(400).json({ 
-            success: false,
-            error: 'Aucun message valide après validation',
-            reason: 'Tous les éléments sont invalides (champs number/message manquants)',
-            formatRequired: { number: 'string', message: 'string' }
-        });
-    }
-    
-    // Sauvegarder dans MongoDB
-    try { 
-        await new BulkJobModel(bulkJob).save(); 
-        console.log(`\n💾 Job créé et sauvegardé: ${jobId}`);
-        console.log(`   📧 Messages valides: ${bulkJob.items.length}/${messages.length}\n`);
-    } catch(e) {
-        console.error('⚠️ Erreur sauvegarde job:', e.message);
-    }
-    
-    // Démarrage asynchrone
-    setImmediate(processBulkJob);
-    
-    // Estimation temps
-    const avgDelay = ((RATE_CONFIG.MIN_DELAY_SEC + RATE_CONFIG.MAX_DELAY_SEC) / 2);
-    const estimatedTotalMs = bulkJob.items.length * avgDelay * 1000;
-    const estimatedMinutes = Math.round(estimatedTotalMs / 60000);
-    
-    res.status(202).json({
-        success: true, 
-        jobId: bulkJob.jobId,
-        accepted: bulkJob.items.length,
-        rejected: messages.length - bulkJob.items.length,
-        estimatedTime: {
-            minutes: estimatedMinutes,
-            optimistic: Math.round(estimatedMinutes * 0.7),
-            pessimistic: Math.round(estimatedMinutes * 1.3)
-        },
-        config: bulkJob.config,
-        endpoints: {
-            status: `/bulk-status?jobId=${bulkJob.jobId}`,
-            cancel: { method: 'POST', path: '/bulk-cancel' }
-        },
-        warnings: [
-            'Respectez les limites WhatsApp (≈500 messages/jour recommandé)',
-            'Les délais sont aléatoires pour simuler un comportement humain',
-            'Le job continue même si vous fermez la connexion API'
-        ],
-        info: 'Le traitement a démarré en arrière-plan'
-    });
-});
-
-// Statut bulk job
-app.get('/bulk-status', async (req, res) => {
-    if (!bulkJob) {
-        return res.json({ 
-            status: 'idle', 
-            message: 'Aucun job en cours',
-            hint: 'Créez un job avec POST /send-bulk-messages'
-        });
-    }
-    
-    const total = bulkJob.items?.length || 1;
-    const current = bulkJob.currentIndex + 1;
-    const percent = ((current / total) * 100).toFixed(1);
-    
-    res.json({
-        jobId: bulkJob.jobId,
-        status: bulkJob.status,
-        statusEmoji: {
-            pending: '⏳',
-            running: '🚀',
-            completed: '✅',
-            cancelled: '🛑',
-            paused_daily_limit: '⏸️',
-            failed: '❌'
-        }[bulkJob.status] || '❓',
-        progress: {
-            current: current,
-            total: total,
-            percent: `${percent}%`,
-            remaining: total - current
-        },
-        stats: {
-            sent: bulkJob.sentCount,
-            failed: bulkJob.failedCount,
-            sentToday: bulkJob.sentToday,
-            dailyLimit: bulkJob.config?.dailyLimit || RATE_CONFIG.DEFAULT_DAILY_LIMIT,
-            successRate: total > 0 ? ((bulkJob.sentCount / current) * 100).toFixed(1) + '%' : 'N/A'
-        },
-        timing: {
-            startedAt: bulkJob.startedAt,
-            runningForSeconds: bulkJob.startedAt ? 
-                Math.round((Date.now() - new Date(bulkJob.startedAt).getTime()) / 1000) : null,
-            estimatedRemaining: bulkJob.status === 'running' ?
-                `${Math.round((total - current) * 15 / 60)} minutes` : null
-        },
-        cancelled: bulkJob.cancelled,
-        canCancel: ['running', 'pending', 'paused_daily_limit'].includes(bulkJob.status),
-        actions: {
-            cancel: 'POST /bulk-cancel',
-            details: 'Les résultats complets sont disponibles une fois terminé'
-        }
-    });
-});
-
-// Annulation job
-app.post('/bulk-cancel', (req, res) => {
-    if (!bulkJob) {
-        return res.status(400).json({ 
-            success: false,
-            error: 'Aucun job actif à annuler',
-            hint: 'Créez un job d\'abord avec POST /send-bulk-messages'
-        });
-    }
-    
-    if (!['running', 'pending', 'paused_daily_limit'].includes(bulkJob.status)) {
-        return res.status(400).json({ 
-            success: false,
-            error: `Impossible d'annuler un job en statut "${bulkJob.status}"`,
-            currentStatus: bulkJob.status,
-            cancellableStatuses: ['running', 'pending', 'paused_daily_limit']
-        });
-    }
-    
-    bulkJob.cancelled = true;
-    
-    console.log(`\n🛑 Demande d'annulation reçue pour le job ${bulkJob.jobId}`);
-    
-    res.json({ 
-        success: true, 
-        message: 'Annulation demandée avec succès',
-        jobId: bulkJob.jobId,
-        info: 'Le job s\'arrêtera prochainement (au prochain message)',
-        stats: {
-            sentBeforeCancel: bulkJob.sentCount,
-            remaining: (bulkJob.items?.length || 0) - bulkJob.currentIndex,
-            totalProcessed: bulkJob.currentIndex
-        },
-        note: 'Les messages déjà envoyés ne peuvent pas être annulés'
-    });
-});
-
-// Reset auth
-app.get('/reset-auth', async (req, res) => {
-    try {
-        console.log('\n' + '='.repeat(50));
-        console.log('🗑️ DEMANDE DE RÉINITIALISATION AUTH');
-        console.log('='.repeat(50) + '\n');
-        
-        // Arrêter job en cours
-        if (bulkJob) {
-            bulkJob.cancelled = true;
-            console.log('📤 Job en cours marqué comme annulé');
         }
         
-        // Fermer socket
-        if (sock) { 
-            try { 
-                sock.ev.removeAllListeners();
-                sock.end(); 
-                console.log('📱 Socket fermé');
-            } catch(e) { 
-                console.log('⚠️ Erreur fermeture:', e.message);
-            } 
-            sock = null; 
-            isReady = false; 
-        }
-        
-        // Supprimer auth MongoDB
-        const deleteResult = await AuthModel.deleteMany({});
-        console.log(`🗑️ ${deleteResult.deletedCount} document(s) auth supprimé(s)`);
-        
-        // Reset variables globales
+        // 2. Reset état
+        console.log('   3/4 Reset état global...');
+        sock = null;
+        isReady = false;
+        isFullyInitialized = false;
         isBotStarting = false;
-        connectionOpenCount = 0;
-        retryCount = 0;
+        pairingCodeRequested = false;
         
-        // Annuler reconnexion en cours
+        if (initTimeoutHandle) {
+            clearTimeout(initTimeoutHandle);
+            initTimeoutHandle = null;
+        }
+        
         if (reconnectTimeout) {
             clearTimeout(reconnectTimeout);
             reconnectTimeout = null;
-            console.log('⏹️ Reconnexion planifiée annulée');
         }
         
+        // 3. Attendre
+        console.log('   4/4 Attente 5s...');
+        await sleep(5000);
+        
+        // 4. Relancer (sans incrémenter retryCount car c'est une récupération proactive)
+        console.log('🚀 Relancement connexion...\n');
+        // retryCount = Math.max(0, retryCount - 1); // Optionnel: ne pas pénaliser
+        
+        await connectWhatsApp();
+        
+    } catch (err) {
+        console.error('❌ Erreur pendant reconnexion forcée:', err.message);
+        // Fallback: retry normal
+        retryCount++;
+        const delay = getProgressiveDelay();
+        setTimeout(() => connectWhatsApp(), delay);
+    }
+}
+
+/**
+ * Handler pour les messages entrants (à implémenter selon vos besoins)
+ */
+async function handleIncomingMessage(socket, msg) {
+    // TODO: Votre logique métier ici
+    const from = msg.key.remoteJid;
+    const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+    
+    console.log(`📩 Message de ${from}: ${body.substring(0, 50)}...`);
+    
+    // Exemple de réponse automatique (décommentez si souhaité):
+    /*
+    if (body.toLowerCase() === 'ping') {
+        await sendMessage(from, { text: 'pong! 🏓' });
+    }
+    */
+}
+
+// ============================================================
+// 🌐 API ROUTES (pour Express/Fastify)
+// ============================================================
+
+/**
+ * Setup les routes API pour le bot
+ * @param {object} app - Express/Fastify app
+ */
+function setupAPIRoutes(app) {
+    // Health check
+    app.get('/api/health', (req, res) => {
+        const health = checkSocketHealth();
         res.json({
-            success: true,
-            message: 'Authentification réinitialisée avec succès !',
-            actionsPerformed: [
-                `✅ Socket fermé`,
-                `✅ ${deleteResult.deletedCount} credentials supprimées de MongoDB`,
-                `✅ Variables internes reset`,
-                `✅ Compteur retries remis à zéro`
-            ],
-            nextSteps: [
-                '1. Attendre 10-15 secondes',
-                '2. Consulter GET /health pour vérifier le statut',
-                '3. Regarder les LOGS RENDER pour le nouveau QR code',
-                '4. Scannez avec WHATSAPP MESSENGER (application VERTE uniquement)',
-                '⛔ Ne PAS utiliser WhatsApp Web ou Business !'
-            ],
-            autoReconnect: 'Reconnexion automatique dans 5 secondes...',
-            timestamp: new Date().toISOString()
+            service: 'whatsapp-bot-v3',
+            status: health.healthy ? 'OK' : health.ready ? 'DEGRADED' : 'DOWN',
+            ...health,
+            config: {
+                maxRetries: CONFIG.TIMEOUTS.MAX_RETRIES,
+                currentRetry: retryCount,
+                queuedMessages: sendQueue.length
+            }
         });
-        
-        // Reconnexion automatique
-        setTimeout(() => {
-            console.log('\n🔄 Démarrage reconnexion post-reset...');
-            connectWhatsApp();
-        }, 5000);
-        
-    } catch (error) {
-        console.error('❌ Erreur critique reset auth:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message,
-            hint: 'Vérifiez la connexion MongoDB'
-        });
-    }
-});
-
-// Vérifier état auth
-app.get('/check-auth', async (req, res) => {
-    try {
-        const count = await AuthModel.countDocuments();
-        const hasCreds = await AuthModel.exists({ _id: 'creds' });
-        
-        const status = {
-            mongodb_connected: mongoose.connection.readyState === 1,
-            docs_count: count,
-            hasCredentials: !!hasCreds,
-            healthy: count >= 3,
-            details: {
-                creds_document: !!hasCreds,
-                keys_count: Math.max(0, count - 1),
-                estimated_session: hasCreds ? 'existante' : 'inexistante'
-            },
-            recommendations: []
-        };
-        
-        if (count < 3) {
-            status.recommendations.push('Session incomplète - Essayez /reset-auth');
-            status.recommendations.push('Ou attendez la prochaine connexion automatique');
-        } else {
-            status.recommendations.push('Authentification OK - Le bot devrait se connecter');
-            status.recommendations.push('Si pas connecté, vérifiez /health');
-        }
-        
-        res.json(status);
-    } catch (e) {
-        res.status(500).json({ 
-            error: e.message,
-            mongodb_connected: false,
-            hint: 'Vérifiez MONGO_URI dans les variables d\'environnement'
-        });
-    }
-});
-
-// ==================== GESTION ERREURS GLOBALES ====================
-app.use((err, req, res, next) => {
-    console.error('💥 Erreur non gérée:', err.stack);
-    res.status(500).json({ 
-        success: false,
-        error: 'Erreur interne serveur',
-        message: process.env.NODE_ENV === 'development' ? err.message : 'Contactez l\'administrateur',
-        timestamp: new Date().toISOString()
     });
-});
-
-// Route 404
-app.use((req, res) => {
-    res.status(404).json({ 
-        success: false,
-        error: 'Endpoint non trouvé',
-        path: req.path,
-        method: req.method,
-        availableEndpoints: {
-            root: 'GET /',
-            health: ['GET /health', 'GET /ping'],
-            messaging: ['POST /send-message', 'POST /send-bulk-messages'],
-            jobs: ['GET /bulk-status', 'POST /bulk-cancel'],
-            auth: ['GET /reset-auth', 'GET /check-auth']
-        },
-        documentation: 'Visitez GET / pour la documentation complète'
-    });
-});
-
-// ==================== DÉMARRAGE SERVEUR ====================
-app.listen(PORT, async () => {
-    console.log(`
-╔═══════════════════════════════════════════════════════╗
-║                                                       ║
-║   🤖 WHATSAPP BOT v3.2.1                             ║
-║   ─────────────────────                               ║
-║   Version: RENDER OPTIMIZED ULTIMATE                  ║
-║   Statut:  PRÊT                                      ║
-║                                                       ║
-║   ┌─────────────────────────────────────────────────┐ ║
-║   │  Serveur: http://localhost:${PORT.toString().padEnd(19)}│ ║
-║   │  Mode:    Render Free Optimized                 │ ║
-║   │  Node:    ${process.version.padEnd(35)}│ ║
-║   │  PID:     ${process.pid.toString().padEnd(37)}│ ║
-║   └─────────────────────────────────────────────────┘ ║
-║                                                       ║
-║   ✅ Fonctionnalités:                                 ║
-║   • Anti-Timeout 408                                  ║
-║   • Anti-Boucle Infinie                               ║
-║   • Retry Intelligent                                ║
-║   • Bulk Messaging Optimisé                          ║
-║   • Rate Limiting Humain                             ║
-║   • Persistance MongoDB                              ║
-║                                                       ║
-╚═══════════════════════════════════════════════════════╝
-    `);
-
-    // Connexion MongoDB initiale
-    try {
-        await mongoose.connect(MONGO_URI, { 
-            serverSelectionTimeoutMS: 15000,
-            socketTimeoutMS: 60000
-        });
-        console.log('✅ MongoDB Atlas connecté au démarrage');
-    } catch (e) {
-        console.error('❌ Erreur connexion MongoDB initiale:', e.message);
-        console.log('⏳ Retente automatiquement au démarrage du bot...\n');
-    }
-
-    // Démarrage du bot avec délai
-    const startupDelay = 10000;
     
-    console.log(`\n⏳ Démarrage du bot WhatsApp dans ${startupDelay / 1000} secondes...`);
-    console.log('   (Délai de stabilisation pour Render)\n');
-    
-    setTimeout(() => {
-        console.log('▶️ Initialisation de la connexion WhatsApp...\n');
-        connectWhatsApp();
-    }, startupDelay);
-});
-
-// ==================== GRACEFUL SHUTDOWN ====================
-process.on('SIGTERM', async () => {
-    console.log('\n' + '='.repeat(50));
-    console.log('🛑 SIGNAL SIGTERM REÇU - Arrêt gracieux en cours...');
-    console.log('='.repeat(50) + '\n');
-    
-    // Annuler reconnexion
-    if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-        console.log('⏹️ Timeout de reconnexion annulé');
-    }
-    
-    // Annuler job
-    if (bulkJob) {
-        bulkJob.cancelled = true;
-        console.log('📤 Job bulk marqué comme annulé');
-    }
-    
-    // Fermer socket
-    if (sock) {
+    // Envoyer un message
+    app.post('/api/send', async (req, res) => {
         try {
-            sock.ev.removeAllListeners();
-            sock.end();
-            console.log('📱 Socket WhatsApp fermé proprement');
-        } catch(e) {
-            console.log('⚠️ Erreur fermeture socket:', e.message);
+            const { jid, message, options } = req.body;
+            
+            if (!jid || !message) {
+                return res.status(400).json({ error: 'jid et message requis' });
+            }
+            
+            const result = await sendMessage(jid, message, options);
+            res.json({ success: true, result });
+            
+        } catch (err) {
+            console.error('❌ API /send error:', err.message);
+            res.status(500).json({ error: err.message });
         }
-    }
+    });
     
-    // Fermer MongoDB
-    try {
-        await mongoose.connection.close();
-        console.log('🗄️ MongoDB déconnecté');
-    } catch(e) {
-        console.log('⚠️ Erreur fermeture MongoDB:', e.message);
-    }
+    // QR Code
+    app.get('/api/qr', (req, res) => {
+        if (!currentQR || !qrGeneratedAt) {
+            return res.json({ 
+                qr: null, 
+                status: 'waiting',
+                message: 'En attente de génération du QR'
+            });
+        }
+        
+        const ageSeconds = (Date.now() - qrGeneratedAt) / 1000;
+        res.json({
+            qr: currentQR,
+            generatedAt: qrGeneratedAt,
+            ageSeconds: Math.round(ageSeconds),
+            expired: ageSeconds > 20, // QR expire après ~20s
+            status: 'active'
+        });
+    });
     
-    console.log('\n✅ Arrêt gracieux complété\n');
-    process.exit(0);
-});
-
-process.on('SIGINT', () => {
-    console.log('\n\n🛑 SIGINT reçu (Ctrl+C)');
-    console.log('Arrêt immédiat...\n');
-    process.exit(0);
-});
-
-// Exceptions non capturées
-process.on('uncaughtException', (error) => {
-    console.error('\n💥 UNCAUGHT EXCEPTION:', error.constructor.name);
-    console.error('Message:', error.message);
+    // Statistiques
+    app.get('/api/stats', (req, res) => {
+        res.json({
+            connections: connectionOpenCount,
+            retries: retryCount,
+            ready: isReady,
+            fullyInitialized: isFullyInitialized,
+            queuedMessages: sendQueue.length,
+            lastMessageSent: lastMessageSentTime,
+            uptime: process.uptime()
+        });
+    });
     
-    if (error.message.includes('Timed Out') || error.message.includes('Timed out')) {
-        console.log('⚠️ Timeout ignoré - La reconnexion va gérer cela automatiquement\n');
-    } else {
-        console.error('Stack:', error.stack);
-        console.log('\n⏳ Arrêt dans 5 secondes...\n');
-        setTimeout(() => process.exit(1), 5000);
-    }
-});
+    console.log('✅ Routes API configurées: /health, /send, /qr, /stats');
+}
 
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('\n💥 UNHANDLED REJECTION:');
-    console.error('Reason:', reason);
-    console.error('Promise:', promise);
-    console.log('');
-});
+// ============================================================
+// 🚀 DÉMARRAGE AUTOMATIQUE
+// ============================================================
+
+/**
+ * Démarre le bot (appeler au démarrage du serveur)
+ */
+async function startBot() {
+    console.log('\n' + '🚀'.repeat(30));
+    console.log(' DÉMARRAGE WHATSAPP BOT v3.0');
+    console.log('🚀'.repeat(30));
+    console.log(`\n⏰ Heure: ${new Date().toISOString()}`);
+    console.log(`🎯 Version: Production Stable`);
+    console.log(`📍 Environnement: ${process.env.NODE_ENV || 'development'}`);
+    
+    // Démarrer la connexion
+    await connectWhatsApp();
+    
+    // Health check périodique (toutes les 5 minutes)
+    setInterval(() => {
+        const health = checkSocketHealth();
+        console.log(`\n${new Date().toISOString()} | Health: ${health.healthy ? '✅ OK' : health.ready ? '⚠️ DEGRADED' : '❌ DOWN'} | Init: ${health.fullyInitialized} | Queue: ${sendQueue.length}`);
+        
+        // Tentative de traitement de la file si dégradé mais ready
+        if (health.ready && !health.fullyInitialized && sendQueue.length > 0) {
+            console.log('⚠️ File d\'attente non vide mais init incomplète - Messages en attente');
+        }
+    }, 300000); // 5 minutes
+}
+
+// ============================================================
+// 📦 EXPORTS
+// ============================================================
+
+module.exports = {
+    // Fonctions principales
+    connectWhatsApp,
+    startBot,
+    setupAPIRoutes,
+    
+    // Fonctions d'envoi
+    sendMessage,
+    canSendMessage,
+    
+    // Utilitaires
+    checkSocketHealth,
+    getProgressiveDelay,
+    
+    // États (lecture seule)
+    get isReady() { return isReady; },
+    get isFullyInitialized() { return isFullyInitialized; },
+    getConnectionInfo: () => ({
+        sock: !!sock,
+        isReady,
+        isFullyInitialized,
+        retryCount,
+        connectionOpenCount,
+        queuedMessages: sendQueue.length,
+        lastMessageSent: lastMessageSentTime
+    })
+};
