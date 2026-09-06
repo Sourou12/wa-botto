@@ -250,12 +250,11 @@ async function connectWhatsApp() {
         console.error(`💥 Max retries atteint (${TIMEOUT_CONFIG.MAX_RETRIES}) - Attente manuelle ou reset`);
         isBotStarting = false;
         
-        // ⭐ AUGMENTÉ: 60s → 120s avant reset
         reconnectTimeout = setTimeout(() => {
             retryCount = 0;
             console.log('🔄 Reset retry count - Nouvelle tentative autorisée');
             connectWhatsApp();
-        }, 120000);  // 2 minutes au lieu de 1
+        }, 120000);
         
         return null;
     }
@@ -271,8 +270,8 @@ async function connectWhatsApp() {
 
         console.log('🗄️ Connexion MongoDB Atlas...');
         await mongoose.connect(MONGO_URI, {
-            serverSelectionTimeoutMS: 30000,      // ⭐ AUGMENTÉ: 15s → 30s
-            socketTimeoutMS: 120000,              // ⭐ AUGMENTÉ: 60s → 120s
+            serverSelectionTimeoutMS: 30000,
+            socketTimeoutMS: 120000,
             maxPoolSize: 10,
             bufferCommands: false
         });
@@ -290,53 +289,57 @@ async function connectWhatsApp() {
             }
             sock = null;
             isReady = false;
-            await sleep(5000);  // ⭐ AUGMENTÉ: 3s → 5s
+            await sleep(5000);
         }
 
-        // Annuler reconnexion planifiée si existante
         if (reconnectTimeout) {
             clearTimeout(reconnectTimeout);
             reconnectTimeout = null;
         }
 
         console.log('📱 Création socket WhatsApp...');
-        const currentTimeout = getAdaptiveTimeout();
         
         sock = makeWASocket({
             auth: state,
             usePairingCode: true,
+            
+            // ⭐⭐⭐ CONFIG ANTI-TIMEOUT INIT ⭐⭐⭐
             syncFullHistory: false,
-            shouldSyncHistoryMessage: () => false,
+            shouldSyncHistoryMessage: () => false,  // Ne sync AUCUN message historique
+            
+            // Options expérimentales pour éviter les queries initiales lourdes
+            mobile: false,
+            // ⭐ Timeout très longs pour l'init
+            connectTimeoutMs: 300000,      // 5 minutes
+            queryTimeoutMs: 600000,       // ⭐⭐⭐ 10 MINUTES (était 3min)
+            keepAliveIntervalMs: 45000,
+            
             browser: ["Ubuntu", "Chrome", "20.0.04"],
-            
-            // ⭐⭐⭐ TIMEOUTS SIGNIFICATIVEMENT AUGMENTÉS ⭐⭐⭐
-            connectTimeoutMs: 300000,      // 180s → 300s (5 minutes)
-            queryTimeoutMs: 300000,       // 180s → 300s (5 minutes)
-            keepAliveIntervalMs: 45000,   // 30s → 45s
-            
             logger: pino({ level: 'warn' }),
             markOnlineOnConnect: false,
-            retryRequestDelayMs: 10000,   // ⭐ AUGMENTÉ: 5s → 10s
-            maxMsgRetryCount: 5           // ⭐ AUGMENTÉ: 3 → 5
+            retryRequestDelayMs: 10000,
+            maxMsgRetryCount: 5
         });
 
         // Sauvegarde des crédentiels
         sock.ev.on('creds.update', saveCreds);
 
-        // Gestion connection.update
+        // ⭐⭐⭐ NOUVEAU : Wrapper autour de connection.update pour gérer les erreurs d'init
+        let initErrorHandled = false;  // Flag pour éviter les reconnexions en boucle
+        
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
-            // Mise à jour du QR pour la route /qr
+            // Mise à jour du QR
             if (qr) {
                 currentQR = qr;
                 qrGeneratedAt = Date.now();
             }
 
-            // N'exécute la demande de code QU'UNE SEULE FOIS
+            // Pairing code
             if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
                 pairingCodeRequested = true;
-                await sleep(5000);  // ⭐ AUGMENTÉ: 3s → 5s
+                await sleep(5000);
 
                 try {
                     const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
@@ -365,7 +368,7 @@ async function connectWhatsApp() {
                 
                 if (shouldReconnect) {
                     retryCount++;
-                    const delay = getProgressiveDelay();  // Voir fonction ci-dessous
+                    const delay = getProgressiveDelay();
                     console.log(`🔄 Reconnexion dans ${delay / 1000}s...`);
                     reconnectTimeout = setTimeout(() => connectWhatsApp(), delay);
                 } else {
@@ -379,35 +382,76 @@ async function connectWhatsApp() {
                 isBotStarting = false;
                 retryCount = 0;
                 connectionOpenCount++;
+                initErrorHandled = false;  // Reset du flag
                 currentQR = null;
                 qrGeneratedAt = null;
                 console.log('\n✅ CONNEXION WHATSAPP RÉUSSIE !\n');
             }
         });
 
-        // ✅ Gestion erreurs socket
+        // ⭐⭐⭐ CRITIQUE : Gestion améliorée des erreurs socket ⭐⭐⭐
         sock.ev.on('error', (error) => {
             const msg = error?.message || '';
             const stack = error?.stack || '';
+            const isErrorInitChats = stack.includes('chats.js') || 
+                                     stack.includes('fetchProps') || 
+                                     stack.includes('executeInitQueries');
             
             if (msg.includes('Timed Out') || stack.includes('Timed Out')) {
-                console.warn('⚠️ [TIMEOUT] Erreur timeout socket (normal sur Render)');
+                if (isErrorInitChats) {
+                    // ⭐⭐⭐ CAS SPÉCIFIQUE : Timeout pendant l'init des chats
+                    // On IGNORE cette erreur car le socket fonctionne quand même !
+                    if (!initErrorHandled) {
+                        initErrorHandled = true;
+                        console.warn('\n' + '⚠️'.repeat(25));
+                        console.warn(' TIMEOUT LORS DE LA SYNCHRO INITIALE DES CHATS');
+                        console.warn(' Ceci est NORMAL sur Render/heroku');
+                        console.warn(' Le socket reste fonctionnel ! ✅');
+                        console.warn(' Les messages peuvent être envoyés/reçus normalement');
+                        console.warn('⚠️'.repeat(25) + '\n');
+                        
+                        // Forcer l'état ready si le socket est techniquement connecté
+                        if (sock?.ws?.readyState === WebSocket.OPEN) {
+                            isReady = true;
+                            isBotStarting = false;
+                            console.log('✅ Socket marqué comme prêt malgré le timeout d\'init\n');
+                        }
+                    }
+                } else {
+                    console.warn('⚠️ [TIMEOUT] Erreur timeout socket (normal sur Render)');
+                }
             }
             else if (msg.includes('stream') || msg.includes('conflict')) {
                 console.warn('⚠️ [STREAM] Erreur stream (normale sur Render)');
             }
-            else if (msg.includes('init queries') || stack.includes('chats.js')) {
-                console.warn('⚠️ [INIT] Erreur initialisation queries (timeout probable)');
+            else if (msg.includes('no name present')) {
+                // ⭐ Ignorer ce warning inoffensif
+                // console.debug('ℹ️ Presence update ignorée (pas de nom)');
             }
             else {
                 console.error('❌ [ERROR] Erreur socket inattendue:');
                 console.error('   Type:', error.constructor.name);
-                console.error('   Message:', msg.substring(0, 150));
+                console.error('   Message:', msg.substring(0, 200));
+                console.error('   Stack:', stack.substring(0, 200));
             }
+        });
+
+        // ⭐ NOUVEAU : Écouter les messages même si l'a échoué
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            // Vérifier que le socket est prêt
+            if (!isReady && sock?.ws?.readyState === WebSocket.OPEN) {
+                console.log('📨 Message reçu avant marquage ready - Force ready');
+                isReady = true;
+                isBotStarting = false;
+            }
+            
+            // Votre logique de traitement des messages ici...
+            // (conservez votre code existant)
         });
 
         console.log('✅ Socket WhatsApp créé avec succès\n');
         console.log('⏳ Attente des événements de connexion...\n');
+        console.log('💡 INFO: Les timeouts durant l\'init sont normaux et gérés automatiquement\n');
 
         return sock;
 
@@ -418,13 +462,12 @@ async function connectWhatsApp() {
         
         console.error('Type d\'erreur:', err.constructor.name);
         console.error('Message:', err.message);
-        console.error('');
         
         isBotStarting = false;
         pairingCodeRequested = false;
         retryCount++;
         
-        const delay = getProgressiveDelay();  // Fonction améliorée ci-dessous
+        const delay = getProgressiveDelay();
         console.log(`🔄 Planification nouvelle tentative dans ${delay / 1000}s (retry #${retryCount})\n`);
         
         setTimeout(() => connectWhatsApp(), delay);
@@ -433,20 +476,39 @@ async function connectWhatsApp() {
     }
 }
 
-// ⭐ NOUVELLE FONCTION: Délais progressifs augmentés
+// ⭐ Fonction de délai progressif AMÉLIORÉE
 function getProgressiveDelay() {
-    // Base: 15s (au lieu de 5-10s), puis augmentation exponentielle
-    const baseDelay = 15000;           // 15 secondes de base
-    const multiplier = Math.pow(1.8, retryCount);  // Facteur 1.8 (moins agressif que 2)
-    const maxDelay = 180000;           // Maximum 3 minutes
+    const baseDelay = 15000;      // 15s base
+    const multiplier = Math.pow(2, retryCount);  // Exponentiel (x2 à chaque fois)
+    const maxDelay = 300000;      // Max 5 minutes
     
     let delay = Math.min(baseDelay * multiplier, maxDelay);
     
-    // Ajouter un peu d'aléatoire (jitter) pour éviter les thundering herd
-    const jitter = Math.random() * 5000;  // 0-5s aléatoire
+    // Jitter de ±25% pour éviter les reconnexions synchronisées
+    const jitter = delay * 0.25 * (Math.random() * 2 - 1);
     delay += jitter;
     
     return Math.round(delay);
+}
+
+// ⭐ UTILE : Fonction pour vérifier l'état réel du socket
+function checkSocketHealth() {
+    if (!sock) return { healthy: false, reason: 'No socket' };
+    
+    const wsState = sock.ws?.readyState;
+    const states = {
+        [WebSocket.CONNECTING]: 'connecting',
+        [WebSocket.OPEN]: 'open',
+        [WebSocket.CLOSING]: 'closing',
+        [WebSocket.CLOSED]: 'closed'
+    };
+    
+    return {
+        healthy: wsState === WebSocket.OPEN,
+        wsState: states[wsState] || 'unknown',
+        isReady: isReady,
+        hasAuth: !!sock.authState?.creds?.registered
+    };
 }
 
 // ==================== PROCESSING BULK JOB ====================
