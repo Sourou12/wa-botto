@@ -322,123 +322,74 @@ async function connectWhatsApp() {
         });
 
         // ==================== GESTION DES ÉVÉNEMENTS ====================
-        
-        // ✅ Credentials update
-        sock.ev.on('creds.update', saveCreds);
+        let pairingCodeRequested = false;
 
-        // ✅ Connection update (avec gestion QR manuelle)
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const errorMessage = lastDisconnect?.error?.message || '';
+            const errorMessage = lastDisconnect?.error?.message;
 
-            // ⭐ GESTION QR CODE (remplace printQRInTerminal)
-            // Dans sock.ev.on('connection.update', async (update) => { ...
-
-// Remplacez votre "if (qr)" existant par ceci :
-if (qr && !sock.authState.creds.registered) {
-    await sleep(3000);
-    try {
-        const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
-        const code = await sock.requestPairingCode(cleanNumber);
-        
-        console.log('\n' + '='.repeat(40));
-        console.log(`📱 NUMÉRO UTILISÉ : ${cleanNumber}`);
-        console.log(`🔑 CODE D'APPAIRAGE GÉNÉRÉ : ${code}`);
-        console.log('='.repeat(40) + '\n');
-    } catch (err) {
-        console.error('❌ Erreur génération Pairing Code:', err.message);
-    }
-}
-
-            // ⭐ GESTION DÉCONNEXION
-            if (connection === 'close') {
-                isReady = false;
-                
-                console.log('\n' + '❌'.repeat(25));
-                console.log(` CONNEXION FERMÉE`);
-                console.log(` Code erreur: ${statusCode || 'inconnu'}`);
-                if (errorMessage) console.log(` Message: ${errorMessage.substring(0, 80)}...`);
-                console.log('❌'.repeat(25) + '\n');
-                
-                // Timeout 408 (init queries/fetchProps)
-                if (statusCode === 408) {
-                    console.log('🔍 Diagnostic: Timeout lors de l\'initialisation');
-                    console.log('   → Très fréquent sur Render (latence réseau)');
+            // ⭐ Générer le code D'UNE SEULE FOIS
+            if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
+                pairingCodeRequested = true;
+                await sleep(2000);
+                try {
+                    const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
+                    const code = await sock.requestPairingCode(cleanNumber);
                     
-                    retryCount++;
-                    isBotStarting = false;
-                    
-                    if (reconnectTimeout) clearTimeout(reconnectTimeout);
-                    
-                    const delay = getProgressiveDelay();
-                    console.log(`\n🔄 Planification retry #${retryCount} dans ${delay / 1000} secondes...\n`);
-                    
-                    reconnectTimeout = setTimeout(async () => {
-                        console.log('\n▶️ Exécution du retry post-timeout...');
-                        await connectWhatsApp();
-                    }, delay);
-                }
-                // Conflit/Restart requis
-                else if (statusCode === 440 || statusCode === DisconnectReason.restartRequired) {
-                    console.log('🔍 Diagnostic: Conflit de session ou restart requis');
-                    
-                    retryCount++;
-                    isBotStarting = false;
-                    
-                    if (reconnectTimeout) clearTimeout(reconnectTimeout);
-                    
-                    const delay = Math.max(getProgressiveDelay(), 30000); // Min 30s pour conflit
-                    console.log(`\n🔄 Planification reconnexion dans ${delay / 1000}s (délai long pour conflit)...\n`);
-                    
-                    reconnectTimeout = setTimeout(async () => {
-                        console.log('\n▶️ Exécution de la reconnexion post-conflit...');
-                        await connectWhatsApp();
-                    }, delay);
-                }
-                // Autres erreurs (network, etc.)
-                else if (statusCode !== DisconnectReason.loggedOut) {
-                    console.log('🔍 Diagnostic: Erreur de connexion réseau');
-                    
-                    retryCount = Math.min(retryCount + 1, 2);
-                    isBotStarting = false;
-                    
-                    if (reconnectTimeout) clearTimeout(reconnectTimeout);
-                    
-                    console.log('\n🔄 Reconnexion rapide dans 8 secondes...\n');
-                    reconnectTimeout = setTimeout(() => connectWhatsApp(), 8000);
-                }
-                // Logout explicite
-                else {
-                    console.log('🔒 Session expirée (logged out)');
-                    console.log('   → Action requise: GET /reset-auth pour créer une nouvelle session\n');
-                    isBotStarting = false;
-                    retryCount = 0;
+                    console.log('\n' + '='.repeat(40));
+                    console.log(`📱 NUMÉRO CIBLE : ${cleanNumber}`);
+                    console.log(`🔑 CODE D'APPAIRAGE : ${code}`);
+                    console.log('='.repeat(40) + '\n');
+                } catch (err) {
+                    console.error('❌ Erreur génération Pairing Code:', err.message);
+                    pairingCodeRequested = false;
                 }
             }
 
             // ⭐ CONNEXION RÉUSSIE
             if (connection === 'open') {
                 isReady = true;
-                connectionOpenCount++;
                 isBotStarting = false;
-                retryCount = 0; // Reset succès
-                
-                const phoneNumber = sock.user?.id?.split(':')[0] || 'Inconnu';
-                
-                console.log('\n' + '╔'.repeat(50));
-                console.log('║' + ' '.repeat(12) + '✅ CONNEXION RÉUSSIE !' + ' '.repeat(11) + '║');
-                console.log('╠'.repeat(50));
-                console.log(`║  📱 Numéro: ${phoneNumber.padEnd(36)}║`);
-                console.log(`║  🔗 Socket ID: ${(sock.user?.id || 'N/A').padEnd(32)}║`);
-                console.log(`║  🔢 Connexion #${String(connectionOpenCount).padEnd(33)}║`);
-                console.log(`║  ⏰ Heure: ${new Date().toISOString().padEnd(34)}║`);
-                console.log('╚'.repeat(50) + '\n');
+                pairingCodeRequested = false;
+                retryCount = 0;
+                console.log('\n✅ CONNEXION WHATSAPP RÉUSSIE !\n');
+            }
 
-                // Reprendre job si en attente
-                if (bulkJob && ['pending', 'paused_daily_limit'].includes(bulkJob.status)) {
-                    console.log('📤 Reprise automatique du job bulk en attente...');
-                    setTimeout(() => processBulkJob(), 3000);
+            // ⭐ GESTION DÉCONNEXION & ERREURS
+            if (connection === 'close') {
+                isReady = false;
+                pairingCodeRequested = false;
+
+                console.log('\n' + '❌'.repeat(25));
+                console.log(` CONNEXION FERMÉE`);
+                console.log(` Code erreur: ${statusCode || 'inconnu'}`);
+                if (errorMessage) console.log(` Message: ${errorMessage.substring(0, 80)}...`);
+                console.log('❌'.repeat(25) + '\n');
+
+                if (statusCode === 408) {
+                    retryCount++;
+                    isBotStarting = false;
+                    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+                    const delay = getProgressiveDelay();
+                    reconnectTimeout = setTimeout(async () => {
+                        await connectWhatsApp();
+                    }, delay);
+                } else if (statusCode === 440 || statusCode === DisconnectReason.restartRequired) {
+                    retryCount++;
+                    isBotStarting = false;
+                    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+                    const delay = Math.max(getProgressiveDelay(), 30000);
+                    reconnectTimeout = setTimeout(async () => {
+                        await connectWhatsApp();
+                    }, delay);
+                } else if (statusCode !== DisconnectReason.loggedOut) {
+                    retryCount = Math.min(retryCount + 1, 2);
+                    isBotStarting = false;
+                    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+                    reconnectTimeout = setTimeout(() => connectWhatsApp(), 8000);
+                } else {
+                    console.log('❌ Déconnecté de WhatsApp (Logout).');
                 }
             }
         });
