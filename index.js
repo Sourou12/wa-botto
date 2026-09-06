@@ -1,15 +1,18 @@
 /**
- * WHATSAPP BOT v3.2.1 - RENDER OPTIMIZED ULTIMATE
- * Version FINALE CORRIGÉE
+ * WHATSAPP BOT v3.2.2 - RENDER OPTIMIZED ULTIMATE (CORRIGÉ)
  * 
- * ✅ Corrections v3.2.1 :
- * - Suppression printQRInTerminal (déprécié)
- * - Gestion QR code manuelle personnalisée
- * - Correction TypeError listener undefined
- * - Timeouts adaptatifs pour Render
- * - Retry intelligent avec backoff exponentiel
- * - Protection anti-boucle infinie
- * - Rate limiting optimisé
+ * ✅ Corrections v3.2.2 :
+ * - Code orphelin supprimé (handlers en dehors de fonction)
+ * - Redéclaration pairingCodeRequested corrigée
+ * - currentQR / qrGeneratedAt mis à jour correctement
+ * - Sauvegarde bulk job corrigée (findOneAndUpdate par jobId)
+ * - currentIndex mis à jour AVANT envoi (évite doublons)
+ * - Status final n'écrase plus 'cancelled'
+ * - Timeout ajouté dans boucle d'attente reconnexion
+ * - sock.end() remplacé par sock.ws?.close()
+ * - reconnectTimeout stocké et nettoyé
+ * - Gestion DisconnectReason.loggedOut
+ * - startIndex ajouté au schéma Mongoose
  */
 
 const { 
@@ -64,6 +67,7 @@ let reconnectTimeout = null;
 let retryCount = 0;
 let currentQR = null;
 let qrGeneratedAt = null;
+let pairingCodeRequested = false;
 
 // ==================== MODÈLE MONGODB ====================
 const AuthSchema = new mongoose.Schema({
@@ -76,6 +80,7 @@ const BulkJobSchema = new mongoose.Schema({
     jobId: { type: String, unique: true },
     items: [{ number: String, message: String }],
     currentIndex: { type: Number, default: 0 },
+    startIndex: { type: Number, default: 0 },
     sentCount: { type: Number, default: 0 },
     failedCount: { type: Number, default: 0 },
     results: [{
@@ -234,10 +239,7 @@ const RATE_CONFIG = {
     MAX_RETRIES: 3
 };
 
-// ==================== CONNEXION WHATSAPP (VERSION FINALE CORRIGÉE) ====================
-// Variable globale de verrouillage du pairing code
-let pairingCodeRequested = false;
-
+// ==================== CONNEXION WHATSAPP (VERSION CORRIGÉE) ====================
 async function connectWhatsApp() {
     if (isBotStarting) {
         console.log('⚠️ Connexion déjà en cours, skip...');
@@ -248,7 +250,7 @@ async function connectWhatsApp() {
         console.error(`💥 Max retries atteint (${TIMEOUT_CONFIG.MAX_RETRIES}) - Attente manuelle ou reset`);
         isBotStarting = false;
         
-        setTimeout(() => {
+        reconnectTimeout = setTimeout(() => {
             retryCount = 0;
             console.log('🔄 Reset retry count - Nouvelle tentative autorisée');
             connectWhatsApp();
@@ -280,14 +282,20 @@ async function connectWhatsApp() {
         if (sock) {
             console.log('🔄 Fermeture ancienne connexion...');
             try { 
-                sock.ev.removeAllListeners(); 
-                sock.end(); 
+                sock.ev.removeAllListeners();
+                sock.ws?.close();
             } catch(e) { 
                 console.log('⚠️ Erreur fermeture socket:', e.message);
             }
             sock = null;
             isReady = false;
             await sleep(3000);
+        }
+
+        // Annuler reconnexion planifiée si existante
+        if (reconnectTimeout) {
+            clearTimeout(reconnectTimeout);
+            reconnectTimeout = null;
         }
 
         console.log('📱 Création socket WhatsApp...');
@@ -299,7 +307,6 @@ async function connectWhatsApp() {
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
             
-            // ⭐ Signature standardisée pour éviter le rejet par WhatsApp
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             
             connectTimeoutMs: currentTimeout,
@@ -312,17 +319,23 @@ async function connectWhatsApp() {
             maxMsgRetryCount: 3
         });
 
-        // Sauvagarde des crédentiels
+        // Sauvegarde des crédentiels
         sock.ev.on('creds.update', saveCreds);
 
-        // ⭐ GESTION UNIQUE DU PAIRING CODE (ANTI-REFUS)
+        // Gestion connection.update
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
+
+            // Mise à jour du QR pour la route /qr
+            if (qr) {
+                currentQR = qr;
+                qrGeneratedAt = Date.now();
+            }
 
             // N'exécute la demande de code QU'UNE SEULE FOIS
             if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
                 pairingCodeRequested = true;
-                await sleep(3000); // Pause de sécurité
+                await sleep(3000);
 
                 try {
                     const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
@@ -334,7 +347,7 @@ async function connectWhatsApp() {
                     console.log('='.repeat(40) + '\n');
                 } catch (err) {
                     console.error('❌ Erreur génération Pairing Code:', err.message);
-                    pairingCodeRequested = false; // Autorise à réessayer uniquement si erreur
+                    pairingCodeRequested = false;
                 }
             }
 
@@ -342,70 +355,34 @@ async function connectWhatsApp() {
                 isReady = false;
                 isBotStarting = false;
                 pairingCodeRequested = false;
+                currentQR = null;
+                qrGeneratedAt = null;
                 
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                console.log(`❌ Connexion fermée (Status: ${statusCode}). Reconnexion...`);
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                console.log(`❌ Connexion fermée (Status: ${statusCode}).`);
                 
-                retryCount++;
-                setTimeout(() => connectWhatsApp(), TIMEOUT_CONFIG.RETRY_DELAY_BASE);
+                if (shouldReconnect) {
+                    retryCount++;
+                    const delay = getProgressiveDelay();
+                    console.log(`🔄 Reconnexion dans ${delay / 1000}s...`);
+                    reconnectTimeout = setTimeout(() => connectWhatsApp(), delay);
+                } else {
+                    console.log('⛔ Déconnexion volontaire (logged out) - Pas de reconnexion auto');
+                    retryCount = 0;
+                }
             }
 
             if (connection === 'open') {
                 isReady = true;
                 isBotStarting = false;
-                retryCount = 0; // Réinitialise les retries
+                retryCount = 0;
+                connectionOpenCount++;
+                currentQR = null;
+                qrGeneratedAt = null;
                 console.log('\n✅ CONNEXION WHATSAPP RÉUSSIE !\n');
             }
         });
-
-    } catch (err) {
-        console.error('💥 Erreur lors de la connexion:', err.message);
-        isBotStarting = false;
-        pairingCodeRequested = false;
-        retryCount++;
-        setTimeout(() => connectWhatsApp(), TIMEOUT_CONFIG.RETRY_DELAY_BASE);
-    }
-}
-
-        // ==================== GESTION DES ÉVÉNEMENTS ====================
-        let pairingCodeRequested = false;
-
-sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    // ⭐ Demande le code UNE SEULE FOIS et bloque toute nouvelle tentative automatique
-    if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
-        pairingCodeRequested = true;
-        await sleep(3000);
-        try {
-            // S'assure de ne garder que des chiffres
-            const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
-            const code = await sock.requestPairingCode(cleanNumber);
-            
-            console.log('\n' + '='.repeat(40));
-            console.log(`📱 NUMÉRO CIBLE : ${cleanNumber}`);
-            console.log(`🔑 CODE D'APPAIRAGE FIXE : ${code}`);
-            console.log('='.repeat(40) + '\n');
-        } catch (err) {
-            console.error('❌ Erreur génération Pairing Code:', err.message);
-            pairingCodeRequested = false; // Autorise une nouvelle tentative uniquement en cas d'erreur
-        }
-    }
-
-    if (connection === 'close') {
-        isReady = false;
-        isBotStarting = false;
-        pairingCodeRequested = false; // Réinitialise en cas de déconnexion globale
-        console.log('❌ Connexion fermée. Reconnexion dans 10s...');
-        setTimeout(() => connectWhatsApp(), 10000);
-    }
-
-    if (connection === 'open') {
-        isReady = true;
-        isBotStarting = false;
-        console.log('\n✅ CONNEXION WHATSAPP RÉUSSIE !\n');
-    }
-});
 
         // ✅ Gestion erreurs socket
         sock.ev.on('error', (error) => {
@@ -443,10 +420,11 @@ sock.ev.on('connection.update', async (update) => {
         console.error('');
         
         isBotStarting = false;
+        pairingCodeRequested = false;
         retryCount++;
         
         const delay = getProgressiveDelay();
-        console.log(`🔄 Planification nouvelle tentative dans ${delay / 1000}s (retry #${retryCount})\n`);
+        console.log(`🔄 Planification nouvelle tentative dans ${delay / 1000}s(retry #${retryCount})\n`);
         
         setTimeout(() => connectWhatsApp(), delay);
         
