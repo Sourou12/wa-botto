@@ -1,8 +1,10 @@
 // ============================================================
-// 🔐 WHATSAPP BOT v3.1 - VERSION STABLE SANS DOTENV
+// 🤖 WHATSAPP BOT - VERSION COMPLÈTE EN UN SEUL FICHIER
+// ✅ Fonctionne sur Render/Heroku sans configuration complexe
 // ============================================================
 
 const mongoose = require('mongoose');
+const express = require('express');
 const { 
     makeWASocket, 
     useMongoDBAuthState, 
@@ -11,12 +13,8 @@ const {
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
-// Chargement optionnel de dotenv
-try {
-    require('dotenv').config();
-} catch (e) {
-    // dotenv non disponible - OK si variables déjà définies dans l'environnement
-}
+// Chargement optionnel de dotenv (ne crashera pas si absent)
+try { require('dotenv').config(); } catch(e) {}
 
 // ============================================================
 // ⚙️ CONFIGURATION
@@ -25,6 +23,7 @@ try {
 const CONFIG = {
     MONGO_URI: process.env.MONGO_URI || 'mongodb://localhost:27017/whatsapp_bot',
     PAIRING_NUMBER: process.env.PAIRING_NUMBER || '',
+    PORT: process.env.PORT || 3000,
     
     TIMEOUTS: {
         MAX_RETRIES: 10,
@@ -32,19 +31,12 @@ const CONFIG = {
         QUERY_MS: 600000,
         KEEPALIVE_MS: 45000,
         INIT_MAX_WAIT_MS: 90000,
-        SEND_MESSAGE_TIMEOUT_MS: 20000,
-    },
-    
-    RETRY: {
-        BASE_DELAY_MS: 15000,
-        MAX_DELAY_MS: 300000,
-        BACKOFF_FACTOR: 2,
-        JITTER_PERCENT: 0.25
+        SEND_TIMEOUT_MS: 20000
     }
 };
 
 // ============================================================
-// 📦 ÉTAT GLOBAL
+// 📦 VARIABLES GLOBALES
 // ============================================================
 
 let sock = null;
@@ -56,255 +48,128 @@ let reconnectTimeout = null;
 let pairingCodeRequested = false;
 let currentQR = null;
 let qrGeneratedAt = null;
-let connectionOpenCount = 0;
 let initTimeoutHandle = null;
-let lastMessageSentTime = null;
 let sendQueue = [];
+
+// ============================================================
+// 🌐 SERVEUR EXPRESS
+// ============================================================
+
+const app = express();
+app.use(express.json());
+
+app.get('/', (req, res) => {
+    res.json({ 
+        service: 'WhatsApp Bot', 
+        status: 'running',
+        endpoints: ['/api/health', '/api/send', '/api/qr']
+    });
+});
+
+app.get('/api/health', (req, res) => {
+    const wsState = sock?.ws?.readyState;
+    res.json({
+        status: isFullyInitialized && wsState === 1 ? 'OK' : isReady ? 'DEGRADED' : 'DOWN',
+        ready: isReady,
+        initialized: isFullyInitialized,
+        socket: !!sock,
+        wsState: wsState,
+        retries: retryCount,
+        queueSize: sendQueue.length,
+        time: new Date().toISOString()
+    });
+});
+
+app.post('/api/send', async (req, res) => {
+    try {
+        const { jid, message } = req.body;
+        if (!jid || !message) return res.status(400).json({ error: 'jid et message requis' });
+        
+        if (!isFullyInitialized || !sock || sock.ws?.readyState !== 1) {
+            sendQueue.push({ jid, message, time: Date.now() });
+            return res.json({ queued: true, message: 'Message en attente de connexion' });
+        }
+        
+        const result = await Promise.race([
+            sock.sendMessage(jid, message),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), CONFIG.TIMEOUTS.SEND_TIMEOUT_MS))
+        ]);
+        
+        res.json({ success: true, id: result?.key?.id });
+        
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/qr', (req, res) => {
+    res.json({ 
+        qr: currentQR || null, 
+        active: !!currentQR && (Date.now() - qrGeneratedAt) < 20000 
+    });
+});
 
 // ============================================================
 // 🛠️ UTILITAIRES
 // ============================================================
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function getProgressiveDelay() {
-    const { BASE_DELAY_MS, MAX_DELAY_MS, BACKOFF_FACTOR, JITTER_PERCENT } = CONFIG.RETRY;
-    
-    let delay = BASE_DELAY_MS * Math.pow(BACKOFF_FACTOR, retryCount);
-    delay = Math.min(delay, MAX_DELAY_MS);
-    
-    const jitter = delay * JITTER_PERCENT * (Math.random() * 2 - 1);
-    delay = Math.round(delay + jitter);
-    
-    return Math.max(delay, BASE_DELAY_MS);
-}
-
-function checkSocketHealth() {
-    const health = {
-        timestamp: new Date().toISOString(),
-        healthy: false,
-        ready: false,
-        fullyInitialized: false,
-        canSend: false,
-        
-        details: {
-            hasSocket: false,
-            wsState: null,
-            wsStateText: 'unknown',
-            hasAuth: false,
-            userId: null,
-            userName: null,
-            retryCount: retryCount,
-            connectionCount: connectionOpenCount,
-            uptime: null,
-            lastMessageSent: lastMessageSentTime
-        }
-    };
-    
-    if (!sock) return health;
-    
-    health.details.hasSocket = true;
-    const wsState = sock.ws?.readyState;
-    health.details.wsState = wsState;
-    health.details.wsStateText = {0:'connecting',1:'open',2:'closing',3:'closed'}[wsState] || `unknown(${wsState})`;
-    health.details.hasAuth = !!sock.authState?.creds?.registered;
-    health.details.userId = sock.user?.id || null;
-    health.details.userName = sock.user?.name || null;
-    
-    health.ready = isReady && wsState === 1;
-    health.fullyInitialized = isFullyInitialized;
-    health.canSend = health.ready && health.fullyInitialized && health.details.hasAuth;
-    health.healthy = health.canSend;
-    
-    return health;
-}
-
-function queueMessage(jid, message, options = {}) {
-    sendQueue.push({ jid, message, options, timestamp: Date.now(), attempts: 0 });
-    console.log(`📤 Message enfilé (${sendQueue.length} en attente) → ${jid}`);
-}
-
-async function processSendQueue() {
-    if (sendQueue.length === 0 || !canSendMessage()) return;
-    
-    console.log(`\n📬 Traitement file: ${sendQueue.length} message(s)`);
-    
-    while (sendQueue.length > 0) {
-        const item = sendQueue.shift();
-        item.attempts++;
-        
-        try {
-            await sendMessageInternal(item.jid, item.message, item.options);
-            console.log(`✅ Message traité → ${item.jid}`);
-            await sleep(500);
-        } catch (err) {
-            if (item.attempts < 3) {
-                sendQueue.unshift(item);
-                break;
-            }
-            console.error(`❌ Abandon après ${item.attempts} tentatives`);
-        }
-    }
-}
-
-function canSendMessage() {
-    return checkSocketHealth().canSend;
+function getDelay() {
+    let d = 15000 * Math.pow(2, retryCount);
+    d = Math.min(d, 300000);
+    return Math.round(d + (d * 0.25 * (Math.random() * 2 - 1)));
 }
 
 // ============================================================
-// 🚀 ENVOI MESSAGES
-// ============================================================
-
-async function sendMessage(jid, message, options = {}) {
-    if (!jid || typeof jid !== 'string') throw new Error('JID invalide ou manquant');
-    if (!message || typeof message !== 'object') throw new Error('Message invalide ou manquant');
-    
-    if (!canSendMessage()) {
-        console.log(`⏳ Socket pas prêt - Message enfilé pour ${jid}`);
-        queueMessage(jid, message, options);
-        return { queued: true, jid, timestamp: Date.now() };
-    }
-    
-    return sendMessageInternal(jid, message, options);
-}
-
-async function sendMessageInternal(jid, message, options = {}) {
-    const { SEND_MESSAGE_TIMEOUT_MS } = CONFIG.TIMEOUTS;
-    
-    console.log(`\n📤 ENVOI → ${jid}`);
-    console.log(`   Type: ${Object.keys(message)[0] || 'unknown'}`);
-    
-    try {
-        const result = await Promise.race([
-            sock.sendMessage(jid, message, options),
-            new Promise((_, reject) => 
-                setTimeout(() => reject(new Error(`Timeout après ${SEND_MESSAGE_TIMEOUT_MS / 1000}s`)), SEND_MESSAGE_TIMEOUT_MS)
-            )
-        ]);
-        
-        lastMessageSentTime = new Date().toISOString();
-        
-        console.log(`✅ MESSAGE ENVOYÉ !`);
-        console.log(`   ID: ${result?.key?.id || 'N/A'}\n`);
-        
-        setTimeout(processSendQueue, 1000);
-        return result;
-        
-    } catch (err) {
-        console.error(`❌ ÉCHEC ENVOI → ${jid}: ${err.message}`);
-        await handleSendError(err, jid, message, options);
-        throw err;
-    }
-}
-
-async function handleSendError(err, jid, originalMessage, originalOptions) {
-    const msg = err.message || '';
-    
-    if (msg.includes('Timed Out') || msg.includes('timeout')) {
-        isFullyInitialized = false;
-        if (retryCount >= 3) scheduleReconnect();
-    } else if (msg.includes('Connection Closed') || msg.includes('closed') || msg.includes('not open')) {
-        isReady = false;
-        isFullyInitialized = false;
-        scheduleReconnect();
-    } else if (msg.includes('403') || msg.includes('forbidden')) {
-        console.error('   ⛔ Accès refusé - Vérifiez que le numéro n\'a pas bloqué le bot');
-    } else if (msg.includes('428') || msg.includes('precondition') || msg.includes('initialization')) {
-        isFullyInitialized = false;
-        scheduleReconnect();
-    }
-}
-
-function scheduleReconnect() {
-    if (reconnectTimeout) clearTimeout(reconnectTimeout);
-    
-    const delay = getProgressiveDelay();
-    console.log(`\n🔄 Reconnexion dans ${(delay / 1000).toFixed(1)}s`);
-    reconnectTimeout = setTimeout(() => connectWhatsApp(), delay);
-}
-
-// ============================================================
-// 🔌 CONNEXION PRINCIPALE
+// 🔌 CONNEXION WHATSAPP
 // ============================================================
 
 async function connectWhatsApp() {
-    if (isBotStarting) {
-        console.log('⚠️ Connexion déjà en cours, skip...');
-        return null;
-    }
+    if (isBotStarting) return null;
     
     if (retryCount > CONFIG.TIMEOUTS.MAX_RETRIES) {
-        console.error(`💥 Max retries atteint (${CONFIG.TIMEOUTS.MAX_RETRIES})`);
+        console.log('💥 Max retries - Attente 2min...');
         isBotStarting = false;
-        
-        reconnectTimeout = setTimeout(() => {
-            retryCount = 0;
-            connectWhatsApp();
-        }, 120000);
-        
+        reconnectTimeout = setTimeout(() => { retryCount = 0; connectWhatsApp(); }, 120000);
         return null;
     }
     
     isBotStarting = true;
     isFullyInitialized = false;
     
-    if (initTimeoutHandle) {
-        clearTimeout(initTimeoutHandle);
-        initTimeoutHandle = null;
-    }
+    if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
     
     try {
-        console.log('\n' + '='.repeat(60));
-        console.log(`🔐 CONNEXION WHATSAPP v3.1`);
-        console.log(`📊 Tentative #${retryCount + 1}/${CONFIG.TIMEOUTS.MAX_RETRIES + 1}`);
-        console.log(`🕐 ${new Date().toISOString()}`);
-        console.log('='.repeat(60) + '\n');
+        console.log('\n' + '='.repeat(50));
+        console.log(`🔐 CONNEXION WHATSAPP (#${retryCount + 1})`);
+        console.log('='.repeat(50));
 
         // MongoDB
-        console.log('🗄️ Connexion MongoDB...');
-        
+        console.log('🗄️ MongoDB...');
         if (mongoose.connection.readyState !== 1) {
             await mongoose.connect(CONFIG.MONGO_URI, {
                 serverSelectionTimeoutMS: 30000,
-                socketTimeoutMS: 120000,
-                maxPoolSize: 10,
-                bufferCommands: false
+                socketTimeoutMS: 120000
             });
         }
-        console.log('✅ MongoDB connecté !\n');
+        console.log('✅ MongoDB OK\n');
 
         // Auth
         const { state, saveCreds } = await useMongoDBAuthState();
 
         // Cleanup ancien socket
         if (sock) {
-            console.log('🔄 Cleanup ancien socket...');
-            
             try {
-                sock.ev.removeAllListeners('connection.update');
-                sock.ev.removeAllListeners('creds.update');
-                sock.ev.removeAllListeners('error');
-                sock.ev.removeAllListeners('messages.upsert');
-                
-                if (sock.ws?.readyState === 1) {
-                    sock.ws.close(1000, 'Reconnexion planifiée');
-                }
-            } catch (e) {
-                console.log('   ⚠️', e.message);
-            }
-            
+                sock.ev.removeAllListeners();
+                if (sock.ws?.readyState === 1) sock.ws.close(1000, 'Reconnect');
+            } catch(e) {}
             sock = null;
             isReady = false;
-            isFullyInitialized = false;
             await sleep(5000);
         }
 
-        if (reconnectTimeout) {
-            clearTimeout(reconnectTimeout);
-            reconnectTimeout = null;
-        }
+        if (reconnectTimeout) { clearTimeout(reconnectTimeout); reconnectTimeout = null; }
 
         // Création socket
         console.log('📱 Création socket...\n');
@@ -312,7 +177,6 @@ async function connectWhatsApp() {
         sock = makeWASocket({
             auth: state,
             usePairingCode: true,
-            
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
             
@@ -320,185 +184,168 @@ async function connectWhatsApp() {
             queryTimeoutMs: CONFIG.TIMEOUTS.QUERY_MS,
             keepAliveIntervalMs: CONFIG.TIMEOUTS.KEEPALIVE_MS,
             
-            retryRequestDelayMs: 10000,
-            maxMsgRetryCount: 5,
-            
-            browser: ["Ubuntu", "Chrome", "20.0.04"],
-            
+            browser: ["Ubuntu", "Chrome", "20.0"],
             logger: pino({ level: 'warn' }),
-            markOnlineOnConnect: false
+            markOnlineOnConnect: false,
+            retryRequestDelayMs: 10000,
+            maxMsgRetryCount: 5
         });
 
-        // Event listeners
+        // === EVENT LISTENERS ===
         
-        sock.ev.on('creds.update', async (creds) => {
-            try { await saveCreds(creds); } catch (e) { console.error('❌ Erreur creds:', e.message); }
-        });
+        sock.ev.on('creds.update', saveCreds);
 
-        let connectionErrorHandled = false;
-        
+        let errorHandled = false;
+
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
+            // QR
             if (qr) {
                 currentQR = qr;
                 qrGeneratedAt = Date.now();
-                console.log('📷 QR généré');
+                console.log('📷 QR Code généré');
             }
 
+            // Pairing code
             if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
                 pairingCodeRequested = true;
                 await sleep(5000);
-
+                
                 try {
-                    const cleanNumber = CONFIG.PAIRING_NUMBER.replace(/[^0-9]/g, '');
+                    const num = CONFIG.PAIRING_NUMBER.replace(/[^0-9]/g, '');
+                    if (!num || num.length < 10) throw new Error('Numéro invalide');
                     
-                    if (!cleanNumber || cleanNumber.length < 10) {
-                        throw new Error(`Numéro invalide: ${CONFIG.PAIRING_NUMBER}`);
-                    }
-                    
-                    const code = await sock.requestPairingCode(cleanNumber);
-                    
-                    console.log('\n' + '='.repeat(50));
-                    console.log(`📱 NUMÉRO : ${cleanNumber}`);
-                    console.log(`🔑 CODE : ${code}`);
-                    console.log('='.repeat(50) + '\n');
-                    
-                } catch (err) {
-                    console.error('❌ Pairing:', err.message);
+                    const code = await sock.requestPairingCode(num);
+                    console.log(`\n🔑 CODE: ${code}\n📱 NUMÉRO: ${num}\n`);
+                } catch(e) {
+                    console.error('❌ Pairing:', e.message);
                     pairingCodeRequested = false;
                 }
             }
 
+            // Close
             if (connection === 'close') {
                 isReady = false;
                 isFullyInitialized = false;
                 isBotStarting = false;
-                pairingCodeRequested = false;
+                errorHandled = false;
                 currentQR = null;
-                qrGeneratedAt = null;
-                connectionErrorHandled = false;
                 
-                if (initTimeoutHandle) {
-                    clearTimeout(initTimeoutHandle);
-                    initTimeoutHandle = null;
-                }
+                if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
                 
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                const code = lastDisconnect?.error?.output?.statusCode;
+                const reconnect = code !== DisconnectReason.loggedOut;
                 
-                console.log('\n❌ Connexion fermée (Status: ' + (statusCode || 'N/A') + ')');
+                console.log(`\n❌ Fermée (${code}) - Reconnect: ${reconnect}`);
                 
-                if (shouldReconnect) {
+                if (reconnect) {
                     retryCount++;
-                    const delay = getProgressiveDelay();
-                    console.log(`🔄 Reconnexion dans ${(delay / 1000).toFixed(1)}s (#${retryCount})\n`);
-                    reconnectTimeout = setTimeout(() => connectWhatsApp(), delay);
+                    const d = getDelay();
+                    console.log(`🔄 Retry dans ${(d/1000).toFixed(1)}s\n`);
+                    reconnectTimeout = setTimeout(connectWhatsApp, d);
                 } else {
                     console.log('⛔ Logged out\n');
                     retryCount = 0;
                 }
             }
 
+            // Open
             if (connection === 'open') {
                 isReady = true;
                 isBotStarting = false;
                 retryCount = 0;
-                connectionErrorHandled = false;
-                connectionOpenCount++;
+                errorHandled = false;
                 currentQR = null;
-                qrGeneratedAt = null;
                 
-                console.log('\n✅'.repeat(30));
-                console.log(' CONNEXION RÉUSSIE !');
-                console.log('✅'.repeat(30));
-                console.log(`👤 ${sock.user?.name || 'Sans nom'}`);
-                console.log(`📱 ${sock.user?.id || 'inconnu'}`);
-                console.log(`🔢 #${connectionOpenCount}`);
-                console.log(`\n⏳ Attente initialisation... (${CONFIG.TIMEOUTS.INIT_MAX_WAIT_MS / 1000}s max)\n`);
-                
+                console.log(`\n✅ CONNEXION RÉUSSIE !`);
+                console.log(`👤 ${sock.user?.name || '?'}`);
+                console.log(`📱 ${sock.user?.id || '?'}`);
+                console.log(`\n⏳ Initialisation... (${CONFIG.TIMEOUTS.INIT_MAX_WAIT_MS/1000}s max)\n`);
+
+                // Timeout si l'init bloque trop longtemps
                 initTimeoutHandle = setTimeout(async () => {
                     if (!isFullyInitialized && isReady) {
-                        console.warn('\n⚠️ Init trop longue - Reconnexion forcée\n');
-                        await forceCleanReconnect();
+                        console.warn('⚠️ Init trop longue - Reconnexion...\n');
+                        await forceReconnect();
                     }
                 }, CONFIG.TIMEOUTS.INIT_MAX_WAIT_MS);
             }
         });
 
-        // Gestion erreurs
+        // Erreurs socket
         sock.ev.on('error', async (error) => {
             const msg = error?.message || '';
             const stack = error?.stack || '';
-            const isErrorInitChats = stack.includes('chats.js') || stack.includes('fetchProps') || stack.includes('executeInitQueries');
-            
-            if ((msg.includes('Timed Out') || stack.includes('Timed Out')) && isErrorInitChats) {
-                if (!connectionErrorHandled) {
-                    connectionErrorHandled = true;
+            const isInitError = stack.includes('chats.js') || stack.includes('fetchProps');
+
+            // Timeout pendant l'init des chats → RECONNEXION FORCÉE
+            if ((msg.includes('Timed Out') || stack.includes('Timed Out')) && isInitError) {
+                if (!errorHandled) {
+                    errorHandled = true;
+                    console.warn('\n⚠️ Timeout chats.js → Reconnexion forcée\n');
                     
-                    console.warn('\n⚠️ Timeout chats.js détecté - Reconnexion forcée\n');
-                    
-                    if (initTimeoutHandle) {
-                        clearTimeout(initTimeoutHandle);
-                        initTimeoutHandle = null;
-                    }
-                    
-                    await forceCleanReconnect();
+                    if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
+                    await forceReconnect();
                 }
                 return;
             }
-            
-            if (msg.includes('Timed Out') || stack.includes('Timed Out')) {
-                console.warn('⚠️ Timeout socket (non-critique)\n');
+
+            // Autres timeouts (non critiques)
+            if (msg.includes('Timed Out')) {
+                console.warn('⚠️ Timeout (normal)\n');
                 return;
             }
-            
-            if (msg.includes('stream') || msg.includes('conflict')) {
-                console.warn('⚠️ Stream error (normal)\n');
-                return;
-            }
-            
-            if (msg.includes('no name present')) {
-                return; // Silencieux
-            }
-            
-            console.error('❌ Socket error:', msg.substring(0, 200));
+
+            // Stream errors (normaux)
+            if (msg.includes('stream') || msg.includes('conflict')) return;
+
+            // Presence warning (inoffensif)
+            if (msg.includes('no name present')) return;
+
+            console.error('❌ Socket error:', msg.substring(0, 150));
         });
 
         // Messages entrants
         sock.ev.on('messages.upsert', async ({ messages }) => {
+            // Marquer comme initialisé quand on reçoit un message
             if (!isFullyInitialized && isReady && sock?.ws?.readyState === 1) {
-                console.log('📨 Message reçu → Init confirmée');
-                markAsFullyInitialized();
+                isFullyInitialized = true;
+                if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
+                console.log('✅ Initialisation confirmée par message reçu\n');
+                processQueue();
             }
-            
+
             if (!isReady || !messages) return;
-            
-            try {
-                for (const msg of messages.filter(m => !m.notificationType && !m.key.fromMe)) {
-                    // Votre logique ici
-                    console.log(`📩 De ${msg.key.remoteJid}: ${(msg.message?.conversation || '').substring(0, 50)}`);
+
+            for (const m of messages.filter(x => !x.notificationType && !x.key.fromMe)) {
+                try {
+                    const from = m.key.remoteJid;
+                    const body = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
+                    console.log(`📩 ${from}: ${body.substring(0, 50)}`);
+                    
+                    // VOTRE LOGIQUE ICI (ex: auto-réponse)
+                    // if (body === 'ping') await sendMessageSafe(from, { text: 'pong!' });
+                    
+                } catch(e) {
+                    console.error('❌ Msg error:', e.message);
                 }
-            } catch (e) {
-                console.error('❌ Erreur traitement:', e.message);
             }
         });
 
-        console.log('✅ Socket créé - Attente événements...\n');
+        console.log('✅ Socket créé\n');
         return sock;
 
-    } catch (err) {
-        console.error('\n💥 ERREUR CRITIQUE:', err.message);
+    } catch(err) {
+        console.error('\n💥 ERREUR:', err.message);
         
         isBotStarting = false;
         isFullyInitialized = false;
-        pairingCodeRequested = false;
         retryCount++;
         
-        const delay = getProgressiveDelay();
-        console.error(`🔄 Retry dans ${(delay / 1000).toFixed(1)}s (#${retryCount})\n`);
-        
-        setTimeout(() => connectWhatsApp(), delay);
+        const d = getDelay();
+        console.log(`🔄 Retry dans ${(d/1000).toFixed(1)}s\n`);
+        setTimeout(connectWhatsApp, d);
         return null;
     }
 }
@@ -507,134 +354,96 @@ async function connectWhatsApp() {
 // 🔧 FONCTIONS AUXILIAIRES
 // ============================================================
 
-function markAsFullyInitialized() {
-    if (!isFullyInitialized) {
-        isFullyInitialized = true;
-        
-        if (initTimeoutHandle) {
-            clearTimeout(initTimeoutHandle);
-            initTimeoutHandle = null;
-        }
-        
-        console.log('\n🎉 SOCKET PLEINEMENT INITIALISÉ - Prêt à envoyer !\n');
-        setTimeout(processSendQueue, 2000);
-    }
-}
-
-async function forceCleanReconnect() {
-    console.log('\n🔁 RECONNEXION FORCÉE...\n');
+async function forceReconnect() {
+    console.log('🔁 Reconnexion forcée...\n');
     
     try {
         if (sock) {
             sock.ev.removeAllListeners();
-            if (sock.ws?.readyState === 1) {
-                sock.ws.close(4001, 'Timeout init - Reconnexion');
-            }
+            if (sock.ws?.readyState === 1) sock.ws.close(4001, 'Force reconnect');
         }
-        
-        sock = null;
-        isReady = false;
-        isFullyInitialized = false;
-        isBotStarting = false;
-        pairingCodeRequested = false;
-        
-        if (initTimeoutHandle) {
-            clearTimeout(initTimeoutHandle);
-            initTimeoutHandle = null;
-        }
-        if (reconnectTimeout) {
-            clearTimeout(reconnectTimeout);
-            reconnectTimeout = null;
-        }
-        
-        await sleep(5000);
-        await connectWhatsApp();
-        
-    } catch (err) {
-        console.error('❌ Erreur reconnexion:', err.message);
-        retryCount++;
-        setTimeout(() => connectWhatsApp(), getProgressiveDelay());
+    } catch(e) {}
+    
+    sock = null;
+    isReady = false;
+    isFullyInitialized = false;
+    isBotStarting = false;
+    
+    if (initTimeoutHandle) { clearTimeout(initTimeoutHandle); initTimeoutHandle = null; }
+    if (reconnectTimeout) { clearTimeout(reconnectTimeout); reconnectTimeout = null; }
+    
+    await sleep(5000);
+    await connectWhatsApp();
+}
+
+async function sendMessageSafe(jid, message) {
+    if (!isFullyInitialized || !sock || sock.ws?.readyState !== 1) {
+        sendQueue.push({ jid, message, time: Date.now() });
+        console.log(`📤 Enfilé → ${jid}`);
+        return null;
+    }
+
+    try {
+        const result = await Promise.race([
+            sock.sendMessage(jid, message),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 20000))
+        ]);
+        console.log(`✅ Envoyé → ${jid}`);
+        return result;
+    } catch(err) {
+        console.error(`❌ Échec envoi → ${jid}:`, err.message);
+        sendQueue.push({ jid, message, time: Date.now() });
+        return null;
     }
 }
 
-// ============================================================
-// 🌐 API ROUTES
-// ============================================================
-
-function setupAPIRoutes(app) {
-    app.get('/api/health', (req, res) => {
-        const health = checkSocketHealth();
-        res.json({
-            service: 'whatsapp-bot-v3.1',
-            status: health.healthy ? 'OK' : health.ready ? 'DEGRADED' : 'DOWN',
-            ...health,
-            queuedMessages: sendQueue.length
-        });
-    });
+function processQueue() {
+    if (sendQueue.length === 0 || !isFullyInitialized) return;
     
-    app.post('/api/send', async (req, res) => {
-        try {
-            const { jid, message, options } = req.body;
-            if (!jid || !message) return res.status(400).json({ error: 'jid et message requis' });
-            
-            const result = await sendMessage(jid, message, options);
-            res.json({ success: true, result });
-        } catch (err) {
-            res.status(500).json({ error: err.message });
-        }
-    });
+    console.log(`\n📬 File d'attente: ${sendQueue.length} message(s)\n`);
     
-    app.get('/api/qr', (req, res) => {
-        if (!currentQR) return res.json({ qr: null, status: 'waiting' });
-        
-        res.json({
-            qr: currentQR,
-            ageSeconds: Math.round((Date.now() - qrGeneratedAt) / 1000),
-            expired: (Date.now() - qrGeneratedAt) > 20000,
-            status: 'active'
-        });
-    });
-    
-    console.log('✅ Routes API: /health, /send, /qr');
+    while (sendQueue.length > 0) {
+        const item = sendQueue.shift();
+        sendMessageSafe(item.jid, item.message).catch(() => {});
+    }
 }
 
 // ============================================================
 // 🚀 DÉMARRAGE
 // ============================================================
 
-async function startBot() {
-    console.log('\n🚀 WHATSAPP BOT v3.1 - Démarrage...');
-    console.log(`🕐 ${new Date().toISOString()}\n`);
+async function start() {
+    console.log('\n' + '🚀'.repeat(30));
+    console.log(' WHATSAPP BOT - DÉMARRAGE');
+    console.log('🚀'.repeat(30));
+    console.log(`⏰ ${new Date().toISOString()}\n`);
+
+    // Démarrer serveur HTTP (CRITIQUE pour Render)
+    const server = app.listen(CONFIG.PORT, () => {
+        console.log(`🌐 Serveur: http://localhost:${CONFIG.PORT}\n`);
+    });
+
+    server.keepAliveTimeout = 120000;
+
+    // Gestion signaux
+    process.on('SIGTERM', () => { console.log('👋 SIGTERM'); process.exit(0); });
+    process.on('SIGINT', () => { console.log('👋 SIGINT'); process.exit(0); });
     
+    // Ne pas crasher sur erreurs non gérées
+    process.on('unhandledRejection', (r) => console.error('💥 Unhandled:', r));
+    process.on('uncaughtException', (e) => console.error('💥 Uncaught:', e.message));
+
+    // Démarrer WhatsApp
     await connectWhatsApp();
-    
-    // Health check toutes les 5 min
+
+    // Health check périodique
     setInterval(() => {
-        const h = checkSocketHealth();
-        console.log(`${new Date().toISOString()} | ${h.healthy ? '✅' : h.ready ? '⚠️' : '❌'} | Init:${h.fullyInitialized} | Queue:${sendQueue.length}`);
+        const state = isFullyInitialized ? '✅' : isReady ? '⚠️' : '❌';
+        console.log(`${new Date().toISOString()} | ${state} | Queue: ${sendQueue.length}`);
     }, 300000);
+
+    console.log('✅ Système prêt !\n');
 }
 
-// ============================================================
-// 📦 EXPORTS
-// ============================================================
-
-module.exports = {
-    connectWhatsApp,
-    startBot,
-    setupAPIRoutes,
-    sendMessage,
-    canSendMessage,
-    checkSocketHealth,
-    get isReady() { return isReady; },
-    get isFullyInitialized() { return isFullyInitialized; },
-    getConnectionInfo: () => ({
-        sock: !!sock,
-        isReady,
-        isFullyInitialized,
-        retryCount,
-        connectionOpenCount,
-        queuedMessages: sendQueue.length,
-        lastMessageSent: lastMessageSentTime
-    })
-};
+// LANCER
+start();
