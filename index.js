@@ -299,7 +299,7 @@ async function connectWhatsApp() {
         // ⭐ SOCKET SANS printQRInTerminal (option dépréciée supprimée)
         sock = makeWASocket({
             auth: state,
-            
+            usePairingCode: true,
             // ⭐ Options de synchronisation
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
@@ -335,21 +335,20 @@ async function connectWhatsApp() {
             // ⭐ GESTION QR CODE (remplace printQRInTerminal)
             // Dans sock.ev.on('connection.update', async (update) => { ...
 
-// Remplacez le traitement du QR code par :
+// Remplacez votre "if (qr)" existant par ceci :
 if (qr && !sock.authState.creds.registered) {
-  // Attendre 3 secondes que le socket s'initialise complètement
-  await sleep(3000);
-
-  try {
-    const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
-    const code = await sock.requestPairingCode(cleanNumber);
-    
-    console.log('\n' + '='.repeat(40));
-    console.log(`🔑 CODE D'APPAIRAGE GENERÉ : ${code}`);
-    console.log('='.repeat(40) + '\n');
-  } catch (err) {
-    console.error('❌ Erreur lors de la demande du code d\'appairage:', err.message);
-  }
+    await sleep(3000);
+    try {
+        const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
+        const code = await sock.requestPairingCode(cleanNumber);
+        
+        console.log('\n' + '='.repeat(40));
+        console.log(`📱 NUMÉRO UTILISÉ : ${cleanNumber}`);
+        console.log(`🔑 CODE D'APPAIRAGE GÉNÉRÉ : ${code}`);
+        console.log('='.repeat(40) + '\n');
+    } catch (err) {
+        console.error('❌ Erreur génération Pairing Code:', err.message);
+    }
 }
 
             // ⭐ GESTION DÉCONNEXION
