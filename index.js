@@ -306,16 +306,14 @@ async function connectWhatsApp() {
             usePairingCode: true,
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
-            getMessage: async (key) => { return { conversation: 'Hello' }; },
-    fetchAgentProps: false, 
             browser: ["Ubuntu", "Chrome", "20.0.04"],
-            
-            connectTimeoutMs: currentTimeout,
-            keepAliveIntervalMs: TIMEOUT_CONFIG.KEEP_ALIVE_INTERVAL,
-            queryTimeoutMs: currentTimeout,
-            
-            logger: pino({ level: 'warn' }),
-            markOnlineOnConnect: false,
+            // ⭐ Timeouts rallongés pour éviter l'expiration des requêtes initiales
+    connectTimeoutMs: 180000,
+    queryTimeoutMs: 180000,
+    keepAliveIntervalMs: 30000,
+    
+    logger: pino({ level: 'warn' }),
+    markOnlineOnConnect: false
             retryRequestDelayMs: 5000,
             maxMsgRetryCount: 3
         });
