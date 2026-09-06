@@ -53,6 +53,7 @@ const TIMEOUT_CONFIG = {
     RETRY_DELAY_MAX: 60000,
     MAX_RETRIES: 5
 };
+const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '2290165212113';
 
 // ==================== VARIABLES GLOBALES ====================
 let sock = null;
@@ -332,36 +333,24 @@ async function connectWhatsApp() {
             const errorMessage = lastDisconnect?.error?.message || '';
 
             // ⭐ GESTION QR CODE (remplace printQRInTerminal)
-            if (qr) {
-                isReady = false;
-                currentQR = qr;
-                qrGeneratedAt = Date.now();
-                
-                console.log('\n' + '╔'.repeat(50));
-                console.log('║' + ' '.repeat(15) + '📸 QR CODE GÉNÉRÉ !' + ' '.repeat(14) + '║');
-                console.log('╚'.repeat(50) + '\n');
-                
-                console.log('┌─────────────────────────────────────────────┐');
-                console.log('│  ⚠️  INSTRUCTIONS IMPORTANTES :               │');
-                console.log('│                                             │');
-                console.log('│  1. Ouvrez WHATSAPP MESSENGER (application   │');
-                console.log("│     VERTE sur votre téléphone)              │");
-                console.log('│                                             │');
-                console.log('│  2. Allez dans Paramètres > Appareils liés  │');
-                console.log('│                                             │');
-                console.log('│  3. Appuyez sur "Lier un appareil"          │');
-                console.log('│                                             │');
-                console.log('│  4. Scannez le QR code ci-dessous           │');
-                console.log('│                                             │');
-                console.log("│  ⛔ NE PAS utiliser WhatsApp Web !          │");
-                console.log('└─────────────────────────────────────────────┘\n');
-                
-                // Générer le QR code en ASCII dans les logs
-                qrcode.generate(qr, { small: true });
-                
-                console.log('\n⏳ En attente du scan...');
-                console.log('   (Le QR expire après ~20 secondes)\n');
-            }
+            // Dans sock.ev.on('connection.update', async (update) => { ...
+
+// Remplacez le traitement du QR code par :
+if (qr && !sock.authState.creds.registered) {
+  // Attendre 3 secondes que le socket s'initialise complètement
+  await sleep(3000);
+
+  try {
+    const cleanNumber = PAIRING_NUMBER.replace(/[^0-9]/g, '');
+    const code = await sock.requestPairingCode(cleanNumber);
+    
+    console.log('\n' + '='.repeat(40));
+    console.log(`🔑 CODE D'APPAIRAGE GENERÉ : ${code}`);
+    console.log('='.repeat(40) + '\n');
+  } catch (err) {
+    console.error('❌ Erreur lors de la demande du code d\'appairage:', err.message);
+  }
+}
 
             // ⭐ GESTION DÉCONNEXION
             if (connection === 'close') {
