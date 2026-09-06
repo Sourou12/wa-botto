@@ -306,7 +306,8 @@ async function connectWhatsApp() {
             usePairingCode: true,
             syncFullHistory: false,
             shouldSyncHistoryMessage: () => false,
-            
+            getMessage: async (key) => { return { conversation: 'Hello' }; },
+    fetchAgentProps: false, 
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             
             connectTimeoutMs: currentTimeout,
