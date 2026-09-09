@@ -59,7 +59,7 @@ const TIMEOUT_CONFIG = {
 
 // ⭐ NUMÉRO DE TÉLÉPHONE POUR LE CODE DE PARRAINAGE
 // Remplacez par le numéro qui doit recevoir le code, ou définissez-le dans les variables d'environnement Render
-const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '2290165212113';
+const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '2290140443431';
 
 // ==================== VARIABLES GLOBALES ====================
 let sock = null;
