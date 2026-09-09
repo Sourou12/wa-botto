@@ -1,5 +1,5 @@
 /**
- * WHATSAPP BOT v3.2.2 - RENDER OPTIMIZED ULTIMATE (CORRIGÉ)
+ * WHATSAPP BOT v3.2.3 - RENDER/NORTHFLANK OPTIMIZED ULTIMATE (CORRIGÉ)
  * 
  * ✅ Corrections v3.2.2 :
  * - Code orphelin supprimé (handlers en dehors de fonction)
@@ -13,6 +13,15 @@
  * - reconnectTimeout stocké et nettoyé
  * - Gestion DisconnectReason.loggedOut
  * - startIndex ajouté au schéma Mongoose
+ *
+ * ✅ Nouveautés v3.2.3 :
+ * - Reconnexion automatique même après logged-out (401) : suppression
+ *   des credentials MongoDB + relance connectWhatsApp() -> nouveau code
+ *   de parrainage généré automatiquement dans les logs (à ressaisir
+ *   manuellement, WhatsApp l'exige, mais le bot ne reste plus bloqué)
+ * - Rate limiting resserré pour un usage secondaire (~1000 msg/semaine,
+ *   Baileys en canal complémentaire à l'API Cloud officielle) :
+ *   plafond quotidien abaissé, pauses longues plus fréquentes
  */
 
 const { 
@@ -46,7 +55,7 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 10000;
 const MONGO_URI = process.env.MONGO_URI;
 
-// ⭐ CONFIGURATION TIMEOUTS POUR RENDER
+// ⭐ CONFIGURATION TIMEOUTS
 const TIMEOUT_CONFIG = {
     BASE_CONNECT_TIMEOUT: 120000,
     BASE_QUERY_TIMEOUT: 120000,
@@ -58,7 +67,7 @@ const TIMEOUT_CONFIG = {
 };
 
 // ⭐ NUMÉRO DE TÉLÉPHONE POUR LE CODE DE PARRAINAGE
-// Remplacez par le numéro qui doit recevoir le code, ou définissez-le dans les variables d'environnement Render
+// Remplacez par le numéro qui doit recevoir le code, ou définissez-le dans les variables d'environnement
 const PAIRING_NUMBER = process.env.PAIRING_NUMBER || '2290140443431';
 
 // ==================== VARIABLES GLOBALES ====================
@@ -230,17 +239,22 @@ function getAdaptiveTimeout() {
 }
 
 // ==================== CONFIG RATE LIMITING ====================
+// ⚙️ Ajusté v3.2.3 pour usage SECONDAIRE (Baileys en complément de l'API Cloud,
+// volume cible : ~1000 messages/semaine, soit ~140/jour en moyenne)
 const RATE_CONFIG = {
     MIN_DELAY_SEC: 8,
     MAX_DELAY_SEC: 20,
-    BATCH_SIZE: 10,
-    BATCH_PAUSE_MINUTES: 3,
-    LONG_BREAK_EVERY: 40,
+    BATCH_SIZE: 8,                    // était 10
+    BATCH_PAUSE_MINUTES: 5,           // était 3
+    LONG_BREAK_EVERY: 20,             // était 40 - pause longue plus fréquente
     LONG_BREAK_MIN_MINUTES: 8,
     LONG_BREAK_MAX_MINUTES: 15,
-    DEFAULT_DAILY_LIMIT: 500,
+    DEFAULT_DAILY_LIMIT: 150,         // était 500 - plafond réaliste pour 1000/semaine étalé
     MAX_RETRIES: 3
 };
+
+// Plafond dur absolu accepté par l'API même si un appelant tente de forcer plus haut
+const HARD_DAILY_LIMIT_CAP = 200; // était 1000
 
 // ==================== CONNEXION WHATSAPP (VERSION CORRIGÉE) ====================
 async function connectWhatsApp() {
@@ -371,8 +385,23 @@ async function connectWhatsApp() {
                     console.log(`🔄 Reconnexion dans ${delay / 1000}s...`);
                     reconnectTimeout = setTimeout(() => connectWhatsApp(), delay);
                 } else {
-                    console.log('⛔ Déconnexion volontaire (logged out) - Pas de reconnexion auto');
+                    // ⭐ v3.2.3 : sur logged-out (401), on ne reste plus bloqué.
+                    // On supprime les anciennes credentials puis on relance la
+                    // connexion : un nouveau code de parrainage sera généré
+                    // automatiquement dans les logs (à ressaisir manuellement
+                    // sur le téléphone, WhatsApp l'exige dans ce cas).
+                    console.log('⛔ Session invalidée (logged out) - Réinitialisation + reconnexion auto...');
                     retryCount = 0;
+
+                    try {
+                        await AuthModel.deleteMany({});
+                        console.log('🗑️ Anciennes credentials supprimées de MongoDB');
+                    } catch (e) {
+                        console.error('❌ Erreur suppression credentials:', e.message);
+                    }
+
+                    console.log('🔄 Nouvelle tentative de connexion dans 5s (nouveau code de parrainage à venir)...');
+                    reconnectTimeout = setTimeout(() => connectWhatsApp(), 5000);
                 }
             }
 
@@ -393,10 +422,10 @@ async function connectWhatsApp() {
             const stack = error?.stack || '';
             
             if (msg.includes('Timed Out') || stack.includes('Timed Out')) {
-                console.warn('⚠️ [TIMEOUT] Erreur timeout socket (normal sur Render)');
+                console.warn('⚠️ [TIMEOUT] Erreur timeout socket (normal en hébergement cloud)');
             }
             else if (msg.includes('stream') || msg.includes('conflict')) {
-                console.warn('⚠️ [STREAM] Erreur stream (normale sur Render)');
+                console.warn('⚠️ [STREAM] Erreur stream (normale en hébergement cloud)');
             }
             else if (msg.includes('init queries') || stack.includes('chats.js')) {
                 console.warn('⚠️ [INIT] Erreur initialisation queries (timeout probable)');
@@ -752,10 +781,12 @@ app.get('/health', (req, res) => {
         config: {
             currentTimeout: `${getAdaptiveTimeout() / 1000}s`,
             nextRetryDelay: `${getProgressiveDelay() / 1000}s`,
-            maxRetries: TIMEOUT_CONFIG.MAX_RETRIES
+            maxRetries: TIMEOUT_CONFIG.MAX_RETRIES,
+            dailyLimitDefault: RATE_CONFIG.DEFAULT_DAILY_LIMIT,
+            dailyLimitHardCap: HARD_DAILY_LIMIT_CAP
         },
         timestamp: new Date().toISOString(),
-        version: '3.2.2'
+        version: '3.2.3'
     };
     
     res.status(isReady ? 200 : 503).json(healthStatus);
@@ -765,16 +796,17 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
     res.json({
         service: 'WhatsApp Bot',
-        version: '3.2.2 (Render Optimized Ultimate)',
+        version: '3.2.3 (Reconnexion auto + Rate limiting canal secondaire)',
         status: isReady ? '🟢 Connected' : '🟡 Waiting Pairing / QR',
-        description: 'API WhatsApp avec bulk messaging, rate limiting et persistance MongoDB',
+        description: 'API WhatsApp (canal secondaire, complément API Cloud) avec bulk messaging, rate limiting et persistance MongoDB',
         features: [
             '✅ Code de Parrainage Auto (Pairing Code)',
             '✅ Fallback QR code si échec',
-            '✅ Anti-timeout 408 (Render compatible)',
+            '✅ Anti-timeout 408',
             '✅ Anti-boucle infinie',
             '✅ Retry intelligent progressif',
-            '✅ Bulk messaging optimisé',
+            '✅ Reconnexion auto même après logged-out (nouveau code auto-généré)',
+            '✅ Bulk messaging optimisé (plafonné pour usage secondaire)',
             '✅ Rate limiting humain',
             '✅ Persistance MongoDB'
         ],
@@ -789,7 +821,7 @@ app.get('/', (req, res) => {
             checkAuth: { method: 'GET', path: '/check-auth', description: 'Vérifier l\'état de l\'auth' }
         },
         quickStart: {
-            step1: 'Le code de parrainage s\'affiche automatiquement dans les logs Render au démarrage',
+            step1: 'Le code de parrainage s\'affiche automatiquement dans les logs au démarrage',
             step2: 'Si le code expire, le QR code est accessible via /qr',
             step3: 'Utilisez POST /send-message pour tester',
             step4: 'Utilisez POST /send-bulk-messages pour les envois multiples'
@@ -805,7 +837,7 @@ app.post('/send-message', async (req, res) => {
             error: 'Bot non connecté', 
             hint: 'Attendez la connexion ou vérifiez les logs pour le code de parrainage',
             status: isReady ? 'degraded' : 'offline',
-            action: 'Vérifiez /health ou les logs Render'
+            action: 'Vérifiez /health ou les logs'
         });
     }
     
@@ -918,7 +950,8 @@ app.post('/send-bulk-messages', async (req, res) => {
         status: 'pending', 
         cancelled: false,
         config: {
-            dailyLimit: Math.min(req.body.dailyLimit || RATE_CONFIG.DEFAULT_DAILY_LIMIT, 1000),
+            // ⚙️ Plafond quotidien borné par HARD_DAILY_LIMIT_CAP quoi qu'il arrive
+            dailyLimit: Math.min(req.body.dailyLimit || RATE_CONFIG.DEFAULT_DAILY_LIMIT, HARD_DAILY_LIMIT_CAP),
             batchSize: req.body.batchSize || RATE_CONFIG.BATCH_SIZE,
             batchPauseMinutes: Math.max(req.body.batchPauseMinutes || RATE_CONFIG.BATCH_PAUSE_MINUTES, 3),
             minDelaySec: Math.max(req.body.minDelaySeconds || RATE_CONFIG.MIN_DELAY_SEC, 8),
@@ -968,7 +1001,7 @@ app.post('/send-bulk-messages', async (req, res) => {
             cancel: { method: 'POST', path: '/bulk-cancel' }
         },
         warnings: [
-            'Respectez les limites WhatsApp (≈500 messages/jour recommandé)',
+            `Plafond quotidien appliqué: ${bulkJob.config.dailyLimit} messages/jour max (canal secondaire)`,
             'Les délais sont aléatoires pour simuler un comportement humain',
             'Le job continue même si vous fermez la connexion API'
         ],
@@ -1117,7 +1150,7 @@ app.get('/reset-auth', async (req, res) => {
             nextSteps: [
                 '1. Attendre 10-15 secondes',
                 '2. Consulter GET /health pour vérifier le statut',
-                '3. Regarder les LOGS RENDER pour le nouveau CODE DE PARRAINAGE',
+                '3. Regarder les LOGS pour le nouveau CODE DE PARRAINAGE',
                 '4. Si code expiré, un QR code est disponible sur /qr'
             ],
             autoReconnect: 'Reconnexion automatique dans 5 secondes...',
@@ -1211,14 +1244,13 @@ app.listen(PORT, async () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════╗
 ║                                                       ║
-║   🤖 WHATSAPP BOT v3.2.2                             ║
+║   🤖 WHATSAPP BOT v3.2.3                             ║
 ║   ─────────────────────                               ║
-║   Version: PAIRING CODE EDITION                        ║
+║   Version: RECONNEXION AUTO + RATE LIMITING SECONDAIRE ║
 ║   Statut:  PRÊT                                      ║
 ║                                                       ║
 ║   ┌─────────────────────────────────────────────────┐ ║
 ║   │  Serveur: http://localhost:${PORT.toString().padEnd(19)}│ ║
-║   │  Mode:    Render Free Optimized                 │ ║
 ║   │  Node:    ${process.version.padEnd(35)}│ ║
 ║   │  PID:     ${process.pid.toString().padEnd(37)}│ ║
 ║   └─────────────────────────────────────────────────┘ ║
@@ -1228,7 +1260,8 @@ app.listen(PORT, async () => {
 ║   • Anti-Timeout 408                                  ║
 ║   • Anti-Boucle Infinie                               ║
 ║   • Retry Intelligent                                  ║
-║   • Bulk Messaging Optimisé                          ║
+║   • Reconnexion auto même après logged-out            ║
+║   • Bulk Messaging plafonné (usage secondaire)         ║
 ║   • Rate Limiting Humain                             ║
 ║   • Persistance MongoDB                              ║
 ║                                                       ║
@@ -1249,7 +1282,7 @@ app.listen(PORT, async () => {
     const startupDelay = 10000;
     
     console.log(`\n⏳ Démarrage du bot WhatsApp dans ${startupDelay / 1000} secondes...`);
-    console.log('   (Délai de stabilisation pour Render)\n');
+    console.log('   (Délai de stabilisation)\n');
     
     setTimeout(() => {
         console.log('▶️ Initialisation de la connexion WhatsApp...\n');
